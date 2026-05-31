@@ -169,26 +169,37 @@ class Encoder(nn.Module):
         self.norm_out = nn.GroupNorm(32, block_out, eps=1e-6)
         self.conv_out = ConvBlock3D(block_out, z_channels, kernel_size=(1, 1, 1), causal=True)
 
-    def forward(self, x):
+    @staticmethod
+    def _shape_key(x: torch.Tensor) -> str:
+        t, h, w = x.shape[2], x.shape[3], x.shape[4]
+        return f"t{t}_h{h}_w{w}"
+
+    def forward(self, x, return_intermediates: bool = False):
+        activations = {}
 
         ## down
         x = self.conv_in(x)
         for i_level in range(self.num_blocks):
             for i_block in range(self.num_res_blocks):
                 x = self.down[i_level].block[i_block](x)
-            
-            if i_level <  self.num_blocks - 1:
+
+            activations[self._shape_key(x)] = x
+
+            if i_level < self.num_blocks - 1:
                 x = self.down[i_level].downsample(x)
-        
-        ## mid 
+                activations[self._shape_key(x)] = x
+
+        ## mid
         for res in range(self.num_res_blocks):
             x = self.mid_block[res](x)
-        
 
         x = self.norm_out(x)
         x = swish(x)
         x = self.conv_out(x)
+        activations[self._shape_key(x)] = x
 
+        if return_intermediates:
+            return x, activations
         return x
 
 class Decoder(nn.Module):

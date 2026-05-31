@@ -13,3 +13,7 @@ transformers==4.37.2
 lpips
 av
 decord
+wandb
+Pillow
+triton-windows==3.7.0.post26
+xformers==0.0.35
