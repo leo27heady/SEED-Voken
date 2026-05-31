@@ -1,3 +1,4 @@
+# SQ-VAE-2 latent pyramid (u2 upsamples z_state between stages). Audit taps for your T/resolution.
 seed_everything: true
 trainer:
   accelerator: gpu
@@ -9,11 +10,11 @@ trainer:
   check_val_every_n_epoch: 20
   num_sanity_val_steps: -1
   log_every_n_steps: 100
-  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_vq
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_pyramid
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_vq"
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_pyramid"
         save_top_k: -1
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
@@ -29,7 +30,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: seed-voken-shapes3d
-      name: sqvae2_vq_128_L
+      name: sqvae2_pyramid_128_L
       save_dir: ../../results/vqgan/
 
 model:
@@ -46,17 +47,16 @@ model:
       num_res_blocks: 4
     hierarchy:
       mode: sqvae2
-      token_grid: native
+      token_grid: pyramid
       latent_key: t3_h16_w16
-      blocks_sq: "t3_h16_w16_x1,t9_h64_w64_x1"
+      blocks_sq: "t5_h32_w32_x1,t5_h32_w32_u2"
       tap_channels:
-        t3_h16_w16: 64
-        t9_h64_w64: 256
+        t5_h32_w32: 256
     quantizer:
-      type: vq
+      type: sq
+      prior: zero
       size_dict: [512, 512]
       dim_dict: [64, 64]
-      commitment_weight: 0.25
       log_param_q_init: [4.09434, 4.09434]
       temperature:
         init: 1.0

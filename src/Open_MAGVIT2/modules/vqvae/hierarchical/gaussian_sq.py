@@ -35,12 +35,14 @@ class GaussianSQQuantizer(LayerQuantizer):
         dim_dict: int,
         flg_loss_continuous: bool = False,
         temperature: float = 1.0,
+        prior: str = "zero",
     ):
         super().__init__()
         self.size_dict = size_dict
         self.dim_dict = dim_dict
         self.temperature = temperature
         self.flg_loss_continuous = flg_loss_continuous
+        self.prior = prior.lower()
         self.codebook = nn.Parameter(torch.randn(size_dict, dim_dict))
 
     def set_temperature(self, tau: float) -> None:
@@ -70,9 +72,12 @@ class GaussianSQQuantizer(LayerQuantizer):
         )
         prob_pos = F.softmax(logit_pos, dim=-1)
         log_prob_pos = F.log_softmax(logit_pos, dim=-1)
-        log_prob_pri = torch.log(
-            torch.full_like(prob_pos, 1.0 / self.size_dict)
-        )
+        if self.prior == "zero":
+            log_prob_pri = torch.zeros_like(log_prob_pos)
+        else:
+            log_prob_pri = torch.log(
+                torch.full_like(prob_pos, 1.0 / self.size_dict)
+            )
 
         if flg_train:
             indices = torch.argmax(logit_pos, dim=-1)
@@ -106,15 +111,16 @@ class GaussianSQQuantizer(LayerQuantizer):
         if self.flg_loss_continuous:
             precision_sum = 1.0 / torch.clamp(var_q_pos.sum(), min=1e-10)
             kld_continuous = (
-                torch.sum((z - z_to_decoder) ** 2, dim=(1, 2, 3, 4)) * (0.5 * precision_sum)
+                torch.sum((z - z_to_decoder) ** 2, dim=(1, 2, 3, 4))
+                * (0.5 * precision_sum)
             ).mean()
             aux_loss = kld_discrete + kld_continuous
         else:
             aux_loss = kld_discrete
 
-        flat_avg = avg_probs.reshape(-1)
+        avg_probs_k = prob_pos.mean(dim=(0, 1, 2, 3))
         perplexity = torch.exp(
-            -torch.sum(flat_avg * torch.log(flat_avg + 1e-7))
+            -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
         )
 
         posterior_var = var_main.detach() if torch.is_tensor(var_main) else var_main
@@ -123,7 +129,7 @@ class GaussianSQQuantizer(LayerQuantizer):
             aux_loss=aux_loss,
             perplexity=perplexity,
             indices=indices,
-            log_stats={"posterior_var": posterior_var, "avg_probs": avg_probs},
+            log_stats={"posterior_var": posterior_var, "avg_probs": avg_probs_k},
         )
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:

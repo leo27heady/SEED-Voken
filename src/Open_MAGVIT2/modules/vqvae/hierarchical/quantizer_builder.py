@@ -30,6 +30,7 @@ def build_layer_quantizer(
     commitment_weight: float = 0.25,
     lfq_sample_min_weight: float = 1.0,
     lfq_batch_max_weight: float = 1.0,
+    prior: str = "zero",
 ) -> nn.Module:
     qtype = qtype.lower()
     if qtype == "sq":
@@ -38,6 +39,7 @@ def build_layer_quantizer(
             dim_dict=dim_dict,
             flg_loss_continuous=flg_loss_continuous,
             temperature=temperature,
+            prior=prior,
         )
     if qtype == "vq":
         return DeterministicVQQuantizer(

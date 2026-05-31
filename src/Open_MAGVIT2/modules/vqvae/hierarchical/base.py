@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -13,6 +13,8 @@ class QuantizerResult:
     perplexity: torch.Tensor
     indices: torch.Tensor
     log_stats: Dict[str, Any] = field(default_factory=dict)
+    resolution_key: Optional[str] = None
+    grid_shape: Optional[Tuple[int, int, int]] = None
 
 
 class LayerQuantizer(nn.Module, ABC):

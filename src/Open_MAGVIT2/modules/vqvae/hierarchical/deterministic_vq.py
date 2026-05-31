@@ -25,7 +25,7 @@ class DeterministicVQQuantizer(LayerQuantizer):
         bs, c, t_len, h, w = z.shape
         z_pos = z.permute(0, 2, 3, 4, 1).contiguous()
         distances = calc_distance(z_pos, self.codebook, self.dim_dict)
-        indices = torch.argmin(distances, dim=-1)
+        indices = torch.argmin(distances, dim=-1).reshape(bs, t_len, h, w)
         encodings = F.one_hot(indices.reshape(-1), self.size_dict).type_as(self.codebook)
         z_q = torch.matmul(encodings, self.codebook).reshape(bs, t_len, h, w, c)
         z_to_decoder = z_q.permute(0, 4, 1, 2, 3).contiguous()
@@ -37,7 +37,7 @@ class DeterministicVQQuantizer(LayerQuantizer):
         else:
             commit_loss = torch.zeros((), device=z.device, dtype=z.dtype)
 
-        avg_probs = torch.mean(encodings, dim=0)
+        avg_probs = torch.mean(encodings.float(), dim=0)
         flat_avg = avg_probs.reshape(-1)
         perplexity = torch.exp(
             -torch.sum(flat_avg * torch.log(flat_avg + 1e-7))

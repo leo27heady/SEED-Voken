@@ -124,29 +124,76 @@ class VideoHierVQModel(L.LightningModule):
             h, activations = self.encoder(x, return_intermediates=True)
             z_q, layer_results = self.hier_quant(
                 activations,
+                encoder_bottleneck=h,
                 flg_train=flg_train,
                 flg_quant_det=flg_quant_det,
             )
         else:
             h = self.encoder(x)
+            activations = None
             z_q, layer_results = self.hier_quant(
                 h, flg_train=flg_train, flg_quant_det=flg_quant_det
             )
-        return z_q, layer_results, h
+        return z_q, layer_results, h, activations
+
+    def encode_tokens(self, x, flg_train=False, flg_quant_det=True):
+        """Per-level discrete tokens plus fused z_q for the MAGVIT decoder."""
+        if self.hierarchy_mode != "sqvae2":
+            raise NotImplementedError("encode_tokens is only supported for sqvae2")
+        h, activations = self.encoder(x, return_intermediates=True)
+        z_q, layer_results = self.hier_quant(
+            activations,
+            encoder_bottleneck=h,
+            flg_train=flg_train,
+            flg_quant_det=flg_quant_det,
+        )
+        levels = []
+        for i, result in enumerate(layer_results):
+            meta = self.hier_quant.level_metadata(i)
+            grid = result.grid_shape or tuple(result.indices.shape[1:])
+            levels.append(
+                {
+                    "key": result.resolution_key or meta["resolution_key"],
+                    "indices": result.indices,
+                    "codebook_size": meta["codebook_size"],
+                    "shape": grid,
+                }
+            )
+        return {
+            "levels": levels,
+            "z_q": z_q,
+            "activations": activations,
+            "encoder_bottleneck": h,
+        }
+
+    def decode_from_indices(
+        self,
+        level_indices: List[torch.Tensor],
+        activations: Dict[str, torch.Tensor],
+        encoder_bottleneck: torch.Tensor,
+    ):
+        if self.hierarchy_mode != "sqvae2":
+            raise NotImplementedError("decode_from_indices is only supported for sqvae2")
+        z_q = self.hier_quant.decode_from_indices(
+            level_indices,
+            activations,
+            encoder_bottleneck=encoder_bottleneck,
+        )
+        return self.decode(z_q)
 
     def decode(self, z_q):
         return self.decoder(z_q)
 
     def forward(self, x, flg_train=True, flg_quant_det=False):
-        z_q, layer_results, _ = self.encode(x, flg_train, flg_quant_det)
+        z_q, layer_results, _, _ = self.encode(x, flg_train, flg_quant_det)
         x_rec = self.decode(z_q)
         return x_rec, layer_results
 
     def decode_progressive(self, x, flg_quant_det=True):
         if self.hierarchy_mode == "sqvae2":
-            _, activations = self.encoder(x, return_intermediates=True)
+            h, activations = self.encoder(x, return_intermediates=True)
             _, partial_z = self.hier_quant.forward_progressive(
-                activations, flg_quant_det=flg_quant_det
+                activations, encoder_bottleneck=h, flg_quant_det=flg_quant_det
             )
         else:
             h = self.encoder(x)

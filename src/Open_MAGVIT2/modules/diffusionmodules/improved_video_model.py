@@ -44,13 +44,13 @@ class ConvBlock3D(nn.Module):
                 0
             )
         else:
-            self.padding(
+            self.padding = (
                 width_pad,
                 width_pad,
                 height_pad,
                 height_pad,
                 time_pad,
-                time_pad
+                time_pad,
             )
 
         self.conv_1 = nn.Conv3d(in_planes, out_planes,

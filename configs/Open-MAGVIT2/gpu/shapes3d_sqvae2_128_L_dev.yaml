@@ -37,12 +37,15 @@ model:
       num_res_blocks: 4
     hierarchy:
       mode: sqvae2
+      token_grid: native
+      latent_key: t2_h16_w16
       blocks_sq: "t2_h16_w16_x1,t5_h64_w64_x1"
       tap_channels:
         t2_h16_w16: 64
         t5_h64_w64: 256
     quantizer:
       type: sq
+      prior: zero
       size_dict: [512, 512]
       dim_dict: [64, 64]
       log_param_q_init: [4.09434, 4.09434]

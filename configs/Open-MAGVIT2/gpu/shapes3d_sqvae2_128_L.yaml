@@ -46,12 +46,17 @@ model:
       num_res_blocks: 4
     hierarchy:
       mode: sqvae2
+      # token_grid native: per-tap (T,H,W) indices; latent_key: MAGVIT decoder grid
+      # Re-audit tap keys if sequence_length or resolution changes (see shape_audit.py)
+      token_grid: native
+      latent_key: t3_h16_w16
       blocks_sq: "t3_h16_w16_x1,t9_h64_w64_x1"
       tap_channels:
         t3_h16_w16: 64
         t9_h64_w64: 256
     quantizer:
       type: sq
+      prior: zero
       size_dict: [512, 512]
       dim_dict: [64, 64]
       log_param_q_init: [4.09434, 4.09434]

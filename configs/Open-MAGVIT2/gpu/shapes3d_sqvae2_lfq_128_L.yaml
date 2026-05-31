@@ -1,3 +1,4 @@
+# SQ-VAE-2 with LFQ per layer (in/out projection when dim != log2(codebook_size))
 seed_everything: true
 trainer:
   accelerator: gpu
@@ -46,6 +47,8 @@ model:
       num_res_blocks: 4
     hierarchy:
       mode: sqvae2
+      token_grid: native
+      latent_key: t3_h16_w16
       blocks_sq: "t3_h16_w16_x1,t9_h64_w64_x1"
       tap_channels:
         t3_h16_w16: 64
