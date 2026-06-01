@@ -16,5 +16,7 @@ echo $MASTER_PORT
 ###GPU — flat LFQ baseline
 # NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_lfqgan_128_L.yaml
 
-###GPU — hierarchical SQ-VAE-2 (primary)
+###GPU — hierarchical SQ-VAE-2 (primary; pick L / M / S)
+# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_S.yaml
+# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_M.yaml
 NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_L.yaml

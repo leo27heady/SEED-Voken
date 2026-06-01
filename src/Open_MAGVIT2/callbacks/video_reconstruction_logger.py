@@ -7,6 +7,9 @@ from src.Open_MAGVIT2.utils.video_viz import make_comparison_grid, videos_to_row
 
 
 class VideoReconstructionLogger(L.Callback):
+    """Save reconstruction PNG grids on a fixed validation-epoch schedule.
+    """
+
     def __init__(
         self,
         every_n_epochs: int = 1,
@@ -16,7 +19,7 @@ class VideoReconstructionLogger(L.Callback):
         cell_size: int = 96,
     ):
         super().__init__()
-        self.every_n_epochs = every_n_epochs
+        self.every_n_epochs = max(1, every_n_epochs)
         self.max_samples = max_samples
         self.log_wandb = log_wandb
         self.save_dir = save_dir

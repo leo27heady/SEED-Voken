@@ -55,6 +55,7 @@ model:
         min: 0.1
     learning_rate: 1.0e-4
     training_objective: hq_elbo
+    # progressive_coding: true  # opt-in HQ-style summed per-layer ARELBO distortions
     use_gan: false
     use_ema: false
     top_down_width: 64

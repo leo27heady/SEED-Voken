@@ -42,6 +42,8 @@ class VideoHierVQModel(L.LightningModule):
         wp_iter: Optional[int] = None,
         resume_lr: Optional[float] = None,
         top_down_width: int = 64,
+        progressive_coding: bool = False,
+        progressive_noise_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["ddconfig", "hierarchy", "quantizer", "lossconfig"])
@@ -61,6 +63,8 @@ class VideoHierVQModel(L.LightningModule):
         self.max_it = max_iter
         self.wp_iter = wp_iter
         self.resume_lr = resume_lr
+        self.progressive_coding = progressive_coding
+        self.progressive_noise_weight = progressive_noise_weight
         self.automatic_optimization = False
 
         self.encoder = Encoder(**ddconfig)
@@ -136,17 +140,7 @@ class VideoHierVQModel(L.LightningModule):
             )
         return z_q, layer_results, h, activations
 
-    def encode_tokens(self, x, flg_train=False, flg_quant_det=True):
-        """Per-level discrete tokens plus fused z_q for the MAGVIT decoder."""
-        if self.hierarchy_mode != "sqvae2":
-            raise NotImplementedError("encode_tokens is only supported for sqvae2")
-        h, activations = self.encoder(x, return_intermediates=True)
-        z_q, layer_results = self.hier_quant(
-            activations,
-            encoder_bottleneck=h,
-            flg_train=flg_train,
-            flg_quant_det=flg_quant_det,
-        )
+    def _pack_token_levels(self, layer_results) -> List[Dict[str, Any]]:
         levels = []
         for i, result in enumerate(layer_results):
             meta = self.hier_quant.level_metadata(i)
@@ -159,27 +153,56 @@ class VideoHierVQModel(L.LightningModule):
                     "shape": grid,
                 }
             )
-        return {
-            "levels": levels,
-            "z_q": z_q,
-            "activations": activations,
-            "encoder_bottleneck": h,
-        }
+        return levels
+
+    def encode_tokens(self, x, flg_train=False, flg_quant_det=True):
+        """Per-level discrete tokens plus fused z_q for the MAGVIT decoder."""
+        if self.hierarchy_mode == "sqvae2":
+            h, activations = self.encoder(x, return_intermediates=True)
+            z_q, layer_results = self.hier_quant(
+                activations,
+                encoder_bottleneck=h,
+                flg_train=flg_train,
+                flg_quant_det=flg_quant_det,
+            )
+            return {
+                "levels": self._pack_token_levels(layer_results),
+                "z_q": z_q,
+                "activations": activations,
+                "encoder_bottleneck": h,
+            }
+        if self.hierarchy_mode == "rsqvae":
+            h = self.encoder(x)
+            z_q, layer_results = self.hier_quant(
+                h, flg_train=flg_train, flg_quant_det=flg_quant_det
+            )
+            return {
+                "levels": self._pack_token_levels(layer_results),
+                "z_q": z_q,
+                "activations": None,
+                "encoder_bottleneck": h,
+            }
+        raise NotImplementedError(f"encode_tokens not supported for mode={self.hierarchy_mode}")
 
     def decode_from_indices(
         self,
         level_indices: List[torch.Tensor],
-        activations: Dict[str, torch.Tensor],
-        encoder_bottleneck: torch.Tensor,
+        activations: Optional[Dict[str, torch.Tensor]] = None,
+        encoder_bottleneck: Optional[torch.Tensor] = None,
     ):
-        if self.hierarchy_mode != "sqvae2":
-            raise NotImplementedError("decode_from_indices is only supported for sqvae2")
-        z_q = self.hier_quant.decode_from_indices(
-            level_indices,
-            activations,
-            encoder_bottleneck=encoder_bottleneck,
-        )
-        return self.decode(z_q)
+        if self.hierarchy_mode == "sqvae2":
+            if activations is None or encoder_bottleneck is None:
+                raise ValueError("sqvae2 decode_from_indices requires activations and encoder_bottleneck")
+            z_q = self.hier_quant.decode_from_indices(
+                level_indices,
+                activations,
+                encoder_bottleneck=encoder_bottleneck,
+            )
+            return self.decode(z_q)
+        if self.hierarchy_mode == "rsqvae":
+            z_q = self.hier_quant.decode_from_indices(level_indices)
+            return self.decode(z_q)
+        raise NotImplementedError(f"decode_from_indices not supported for mode={self.hierarchy_mode}")
 
     def decode(self, z_q):
         return self.decoder(z_q)
@@ -189,16 +212,19 @@ class VideoHierVQModel(L.LightningModule):
         x_rec = self.decode(z_q)
         return x_rec, layer_results
 
-    def decode_progressive(self, x, flg_quant_det=True):
+    def decode_progressive(self, x, flg_quant_det=True, flg_train=False):
         if self.hierarchy_mode == "sqvae2":
             h, activations = self.encoder(x, return_intermediates=True)
             _, partial_z = self.hier_quant.forward_progressive(
-                activations, encoder_bottleneck=h, flg_quant_det=flg_quant_det
+                activations,
+                encoder_bottleneck=h,
+                flg_quant_det=flg_quant_det,
+                flg_train=flg_train,
             )
         else:
             h = self.encoder(x)
             _, partial_z = self.hier_quant.forward_progressive(
-                h, flg_quant_det=flg_quant_det
+                h, flg_quant_det=flg_quant_det, flg_train=flg_train
             )
         return [self.decode(z).clamp(-1, 1) for z in partial_z]
 
@@ -206,6 +232,10 @@ class VideoHierVQModel(L.LightningModule):
         x = self.get_input(batch, self.image_key)
         self._update_temperature()
         x_rec, layer_results = self(x, flg_train=True, flg_quant_det=False)
+
+        progressive_recs = None
+        if self.progressive_coding:
+            progressive_recs = self.decode_progressive(x, flg_quant_det=False, flg_train=True)
 
         if self.sche_type is not None and self.resume_lr is None:
             g_it = self.trainer.global_step
@@ -224,7 +254,13 @@ class VideoHierVQModel(L.LightningModule):
             raise NotImplementedError("vqgan training path not wired in v1")
         else:
             opt = self.optimizers()
-            loss, log_dict = compute_hier_elbo_loss(x, x_rec, layer_results)
+            loss, log_dict = compute_hier_elbo_loss(
+                x,
+                x_rec,
+                layer_results,
+                progressive_recs=progressive_recs,
+                progressive_noise_weight=self.progressive_noise_weight,
+            )
             opt.zero_grad()
             self.manual_backward(loss)
             opt.step()

@@ -96,10 +96,19 @@ class RSQTopDown(nn.Module):
             z_sum = z_q if z_sum is None else z_sum + z_q
         return z_sum
 
+    def level_metadata(self, layer_index: int) -> Dict[str, Any]:
+        block = self.blocks[layer_index]
+        size = int(block.quantizer.size_dict)
+        return {
+            "resolution_key": f"layer_{layer_index}",
+            "codebook_size": size,
+        }
+
     def forward_progressive(
         self,
         h: torch.Tensor,
         flg_quant_det: bool = True,
+        flg_train: bool = False,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         z_cur = torch.zeros_like(h)
         z_res = h
@@ -107,7 +116,7 @@ class RSQTopDown(nn.Module):
         for i, block in enumerate(self.blocks):
             var_prefix = self.log_param_q_scalar[: i + 1].exp()
             z_cur, z_res, _ = block(
-                z_cur, z_res, var_prefix, flg_train=False, flg_quant_det=flg_quant_det
+                z_cur, z_res, var_prefix, flg_train=flg_train, flg_quant_det=flg_quant_det
             )
             partial_sums.append(z_cur.clone())
         return z_cur, partial_sums

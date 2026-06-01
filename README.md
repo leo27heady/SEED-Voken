@@ -48,6 +48,8 @@ The project aims to provide advanced visual tokenizers for autoregressive visual
 
 ## 📖 Implementations
 
+- **Hierarchical video tokenizer (SQ-VAE-2 / RSQ on shape video):** [docs/Open-MAGVIT2-hierarchical-vq.md](./docs/Open-MAGVIT2-hierarchical-vq.md)
+
 **Our codebase supports both NPU and GPU for training and inference. All experiments were conducted using the Ascend 910B for training, and we validated our models on the V100. The observed performance between the two platforms is nearly identical.**
 
 ### 🛠️ Installation

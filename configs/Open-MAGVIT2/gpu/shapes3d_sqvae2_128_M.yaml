@@ -1,3 +1,4 @@
+# SQ-VAE-2 native @ 128px, ~168M params (encoder+decoder+hierarchy). Same data/hierarchy as L.
 seed_everything: true
 trainer:
   accelerator: gpu
@@ -6,14 +7,14 @@ trainer:
   num_nodes: 1
   precision: 16-mixed
   max_epochs: 2000
-  check_val_every_n_epoch: 20
+  check_val_every_n_epoch: 4
   num_sanity_val_steps: -1
   log_every_n_steps: 100
-  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_M
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2"
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_M"
         save_top_k: 3
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
@@ -29,7 +30,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: seed-voken-shapes3d
-      name: sqvae2_128_L
+      name: sqvae2_128_M
       save_dir: ../../results/vqgan/
 
 model:
@@ -37,28 +38,26 @@ model:
   init_args:
     ddconfig:
       double_z: False
-      z_channels: 64
+      z_channels: 48
       resolution: 128
       in_channels: 3
       out_ch: 3
-      ch: 128
+      ch: 96
       ch_mult: [1, 2, 2, 4]
-      num_res_blocks: 4
+      num_res_blocks: 3
     hierarchy:
       mode: sqvae2
-      # token_grid native: per-tap (T,H,W) indices; latent_key: MAGVIT decoder grid
-      # Re-audit tap keys if sequence_length or resolution changes (see shape_audit.py)
       token_grid: native
       latent_key: t3_h16_w16
       blocks_sq: "t3_h16_w16_x1,t9_h64_w64_x1"
       tap_channels:
-        t3_h16_w16: 64
-        t9_h64_w64: 256
+        t3_h16_w16: 48
+        t9_h64_w64: 192
     quantizer:
       type: sq
       prior: zero
       size_dict: [512, 512]
-      dim_dict: [64, 64]
+      dim_dict: [48, 48]
       log_param_q_init: [4.09434, 4.09434]
       temperature:
         init: 1.0
@@ -68,7 +67,7 @@ model:
     training_objective: hq_elbo
     use_gan: false
     use_ema: true
-    top_down_width: 64
+    top_down_width: 48
     scheduler_type: "None"
     sche_type: cos
     wpe: 0.01
@@ -81,7 +80,7 @@ model:
 data:
   class_path: main.DataModuleFromConfig
   init_args:
-    batch_size: 2
+    batch_size: 3
     num_workers: 4
     train:
       target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset

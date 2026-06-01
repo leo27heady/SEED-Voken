@@ -34,7 +34,8 @@ This repository provides the scripts and checkpoints to replicate our results.
 
 
 ### 🎤 Features
-* A series of visual tokenizers: (1) image tokenizer for class-conditional image generation (8 $\times$ and 16 $\times$ downsampling rate with 2^18 codebook size), (2) text-conditional image generation (2^14 and 2^18 codebook size with 16 $\times$ downsampling rate), (3) video tokenizer (2^18 codebook size with 4 $\times$ 8 $\times 8$ downsampling rate).
+* A series of visual tokenizers: (1) image tokenizer for class-conditional image generation (8 $\times$ and 16 $\times$ downsampling rate with 2^18 codebook size), (2) text-conditional image generation (2^14 and 2^18 codebook size with 16 $\times$ downsampling rate), (3) video tokenizer (2^18 codebook size with 4 $\times$ 8 $\times$ 8 downsampling rate).
+* **Hierarchical video VQ (HQ-VAE × MAGVIT)** for causal 3D shape video: SQ-VAE-2, RSQ, multi-level native/pyramid grids — see [Open-MAGVIT2-hierarchical-vq.md](./Open-MAGVIT2-hierarchical-vq.md).
 * A family of the autoregressive model ranging from 300M to 1.5B for class-conditional image generation.
 
 **🤗 Open-MAGVIT2 is still under active development. Stay tuned for the update!**

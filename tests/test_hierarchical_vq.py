@@ -141,6 +141,96 @@ def test_sqvae2_native_multilevel_shapes():
     loss.backward()
 
 
+def test_pyramid_progressive_matches_forward():
+    dd = _ddconfig(64)
+    enc = Encoder(**dd)
+    hier = build_top_down(
+        hierarchy_cfg={
+            "mode": "sqvae2",
+            "token_grid": "pyramid",
+            "latent_key": "t2_h8_w8",
+            "blocks_sq": "t2_h8_w8_x1,t5_h64_w64_u2",
+            "tap_channels": {"t2_h8_w8": 64, "t5_h64_w64": 128},
+        },
+        quantizer_cfg={
+            "type": "sq",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+            "log_param_q_init": [4.09434, 4.09434],
+        },
+        z_channels=64,
+        width=64,
+    )
+    x = torch.randn(1, 3, 5, 64, 64)
+    h, acts = enc(x, return_intermediates=True)
+    z_fwd, _ = hier(acts, encoder_bottleneck=h, flg_train=False, flg_quant_det=True)
+    _, partial = hier.forward_progressive(
+        acts, encoder_bottleneck=h, flg_quant_det=True, flg_train=False
+    )
+    assert (partial[-1] - z_fwd).abs().max().item() < 1e-5
+
+
+def test_progressive_arelbo_loss_finite():
+    model = VideoHierVQModel(
+        ddconfig=_ddconfig(64),
+        hierarchy=_native_hierarchy(64),
+        quantizer={
+            "type": "sq",
+            "prior": "zero",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+            "log_param_q_init": [4.09434, 4.09434],
+        },
+        use_ema=False,
+        progressive_coding=True,
+    )
+    x = torch.randn(1, 3, 5, 64, 64)
+    x_rec, layer_results = model(x, flg_train=True)
+    progressive_recs = model.decode_progressive(x, flg_quant_det=False, flg_train=True)
+    loss, log_dict = compute_hier_elbo_loss(
+        x, x_rec, layer_results, progressive_recs=progressive_recs
+    )
+    assert torch.isfinite(loss)
+    assert "loss/mse_progressive_L1" in log_dict
+    loss.backward()
+
+
+def test_rsq_encode_tokens_api():
+    model = VideoHierVQModel(
+        ddconfig=_ddconfig(64),
+        hierarchy={"mode": "rsqvae", "num_layers": 2, "blocks_sq": "8x2"},
+        quantizer={
+            "type": "sq",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+            "log_param_q_init": [4.09434, 4.09434],
+        },
+        use_ema=False,
+    )
+    x = torch.randn(1, 3, 5, 64, 64)
+    tok = model.encode_tokens(x)
+    assert len(tok["levels"]) == 2
+    assert tok["activations"] is None
+    indices = [level["indices"] for level in tok["levels"]]
+    x_rec = model.decode_from_indices(indices)
+    assert x_rec.shape == x.shape
+
+
+def test_vq_only_no_trainable_log_param_q():
+    hier = build_top_down(
+        hierarchy_cfg=_native_hierarchy(64),
+        quantizer_cfg={
+            "type": "vq",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+        },
+        z_channels=64,
+        width=64,
+    )
+    assert not hier._has_sq_layers
+    assert not any(p is hier.log_param_q_scalar for p in hier.parameters())
+
+
 def test_sqvae2_pyramid_u2_doubles_spatial():
     hier = build_top_down(
         hierarchy_cfg={
@@ -252,6 +342,10 @@ if __name__ == "__main__":
     test_lfq_adapter_with_projection()
     test_rsq_topdown_end_to_end()
     test_sqvae2_native_multilevel_shapes()
+    test_pyramid_progressive_matches_forward()
+    test_progressive_arelbo_loss_finite()
+    test_rsq_encode_tokens_api()
+    test_vq_only_no_trainable_log_param_q()
     test_sqvae2_pyramid_u2_doubles_spatial()
     test_lfq_rsq_raises()
     test_encode_tokens_api()

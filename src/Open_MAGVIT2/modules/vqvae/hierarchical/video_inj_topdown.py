@@ -218,9 +218,12 @@ class SQVAE2TopDown(nn.Module):
         log_init = quantizer_cfg.get("log_param_q_init", [4.09434] * self.num_layers)
         if len(log_init) == 1:
             log_init = log_init * self.num_layers
-        self.log_param_q_scalar = nn.Parameter(
-            torch.tensor(log_init, dtype=torch.float32)
-        )
+        self._has_sq_layers = any(q == "sq" for q in qtypes)
+        log_tensor = torch.tensor(log_init, dtype=torch.float32)
+        if self._has_sq_layers:
+            self.log_param_q_scalar = nn.Parameter(log_tensor)
+        else:
+            self.register_buffer("log_param_q_scalar", log_tensor)
 
         idx_end: List[int] = []
         for j, (_, up) in enumerate(layer_specs):
@@ -368,6 +371,7 @@ class SQVAE2TopDown(nn.Module):
         activations: Dict[str, torch.Tensor],
         encoder_bottleneck: Optional[torch.Tensor] = None,
         flg_quant_det: bool = True,
+        flg_train: bool = False,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         latent_thw = self._resolve_latent_thw(activations, encoder_bottleneck)
         ref = encoder_bottleneck if encoder_bottleneck is not None else self._get_activation(
@@ -390,8 +394,11 @@ class SQVAE2TopDown(nn.Module):
             block = self.blocks[i]
 
             if isinstance(block, InjSQBlock):
-                z_state, _ = block(
-                    z_state, act, var_q, flg_train=False, flg_quant_det=flg_quant_det
+                z_state, result = block(
+                    z_state, act, var_q, flg_train=flg_train, flg_quant_det=flg_quant_det
+                )
+                z_latent = z_latent + fuse_to_latent(
+                    align_spatial(result.z_q, latent_thw), latent_thw
                 )
             else:
                 z_latent, z_state, _ = block(
@@ -400,7 +407,7 @@ class SQVAE2TopDown(nn.Module):
                     act,
                     var_q,
                     latent_thw,
-                    flg_train=False,
+                    flg_train=flg_train,
                     flg_quant_det=flg_quant_det,
                     layer_index=i,
                 )
