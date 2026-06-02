@@ -14,7 +14,28 @@ from src.Open_MAGVIT2.modules.scheduler.lr_scheduler import (
     Scheduler_LinearWarmup_CosineDecay,
 )
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.factory import build_top_down, set_all_sq_temperature
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import QuantizerResult
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.hier_elbo_loss import compute_hier_elbo_loss
+
+
+def _layer_codebook_usage_logs(
+    layer_results: List[QuantizerResult], prefix: str
+) -> Dict[str, torch.Tensor]:
+    log_dict: Dict[str, torch.Tensor] = {}
+    for i, result in enumerate(layer_results):
+        stats = result.log_stats
+        if "active_codes" not in stats:
+            continue
+        ac = stats["active_codes"]
+        if not torch.is_tensor(ac):
+            ac = torch.tensor(float(ac))
+        log_dict[f"{prefix}/active_codes_layer_{i + 1}"] = ac.detach().float()
+        uf = stats.get("usage_fraction")
+        if uf is not None:
+            if not torch.is_tensor(uf):
+                uf = torch.tensor(float(uf))
+            log_dict[f"{prefix}/code_usage_frac_layer_{i + 1}"] = uf.detach().float()
+    return log_dict
 
 
 class VideoHierVQModel(L.LightningModule):
@@ -261,6 +282,7 @@ class VideoHierVQModel(L.LightningModule):
                 progressive_recs=progressive_recs,
                 progressive_noise_weight=self.progressive_noise_weight,
             )
+            log_dict.update(_layer_codebook_usage_logs(layer_results, "train"))
             opt.zero_grad()
             self.manual_backward(loss)
             opt.step()
@@ -286,6 +308,7 @@ class VideoHierVQModel(L.LightningModule):
         x = self.get_input(batch, self.image_key)
         x_rec, layer_results = self(x, flg_train=False, flg_quant_det=True)
         loss, log_dict = compute_hier_elbo_loss(x, x_rec, layer_results)
+        log_dict.update(_layer_codebook_usage_logs(layer_results, f"val{suffix}"))
         log_dict = {f"val{suffix}/{k.split('/', 1)[-1]}": v for k, v in log_dict.items()}
         self.log_dict(log_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 

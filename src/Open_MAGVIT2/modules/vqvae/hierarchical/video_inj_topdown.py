@@ -232,10 +232,25 @@ class SQVAE2TopDown(nn.Module):
         idx_end.append(len(layer_specs) - 1)
         self._idx_end_set = set(idx_end)
 
+        lc_cfg = quantizer_cfg.get("flg_loss_continuous", "auto")
+
         blocks = []
         for i, (res_key, upsample) in enumerate(layer_specs):
             act_ch = tap_channels.get(res_key, z_channels)
-            flg_continuous = i in self._idx_end_set
+            if lc_cfg == "auto":
+                flg_continuous = i in self._idx_end_set
+            elif isinstance(lc_cfg, bool):
+                flg_continuous = lc_cfg
+            elif isinstance(lc_cfg, (list, tuple)):
+                if len(lc_cfg) != self.num_layers:
+                    raise ValueError(
+                        f"flg_loss_continuous list length {len(lc_cfg)} != num_layers {self.num_layers}"
+                    )
+                flg_continuous = bool(lc_cfg[i])
+            else:
+                raise ValueError(
+                    f"flg_loss_continuous must be 'auto', bool, or list, got {lc_cfg!r}"
+                )
             q = build_layer_quantizer(
                 qtypes[i],
                 size_dict=size_dict[i],

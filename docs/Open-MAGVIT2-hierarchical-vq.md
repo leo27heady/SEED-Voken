@@ -197,7 +197,7 @@ log = model.log_images({"video": x})
 |------|---------|
 | `shapes3d_sqvae2_128_L.yaml` | Production native SQ-VAE-2, T=9, 128px (~371M params) |
 | `shapes3d_sqvae2_128_M.yaml` | Medium width/depth, same hierarchy (~168M) |
-| `shapes3d_sqvae2_128_S.yaml` | Small width/depth, same hierarchy (~57M) |
+| `shapes3d_sqvae2_128_S.yaml` | Small (~57M); mean KL + `temperature.min: 0.3` |
 | `shapes3d_sqvae2_128_L_dev.yaml` | `fast_dev_run` smoke, T=5 |
 | `shapes3d_sqvae2_pyramid_128_L.yaml` | Pyramid + `u2` example |
 | `shapes3d_rsqvae_128_L.yaml` | RSQ on bottleneck |
@@ -230,6 +230,52 @@ src/Open_MAGVIT2/modules/vqvae/hierarchical/
   factory.py           # build_top_down()
 src/Open_MAGVIT2/models/video_hier_vqgan.py  # Lightning module
 ```
+
+## Troubleshooting (dead L2 / uniform codebook)
+
+Symptoms: `train/perplexity_layer_2` stuck near **codebook size** (uniform over K codes), `progressive_L1` ≈ `progressive_L1-L2`, blurry fine detail.
+
+| Metric | Healthy signal |
+|--------|----------------|
+| `train/perplexity_layer_1` | Drops well below L1 `size_dict` (e.g. &lt; 100 for 512 codes) |
+| `train/perplexity_layer_2` | Well below L2 `size_dict` (not pinned at 512) |
+| `train/active_codes_layer_*` | Multiple codes used; not the only health signal |
+| `train/code_usage_frac_layer_*` | `active_codes / size_dict` |
+| `loss/kl_layer_1` vs `loss/kl_layer_2` | Similar order of magnitude (mean KL per voxel) |
+
+### Perplexity (how it is computed)
+
+For each SQ layer, `prob_pos` is the softmax over the codebook at every `(batch, T, H, W)` position. We average over batch and space to get `p_k`, then:
+
+`perplexity = exp(-Σ_k p_k log p_k)` ∈ **[1, size_dict]**.
+
+- **≈ size_dict** → nearly uniform (bad for discrete tokens).
+- **Much lower** → peaked usage of a subset of codes (good).
+
+This matches standard VQ-VAE codebook perplexity (not the 2D HQ logging variant).
+
+### Stabilization (Tier A)
+
+**Code:** discrete (and continuous) KL in [`gaussian_sq.py`](../src/Open_MAGVIT2/modules/vqvae/hierarchical/gaussian_sq.py) uses **mean over (T, H, W)** then mean over batch, so fine grids do not inflate `loss/kl_layer_2` by ~37k× vs coarse layers.
+
+**S training config** ([`shapes3d_sqvae2_128_S.yaml`](../configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_S.yaml)):
+
+```yaml
+quantizer:
+  size_dict: [512, 512]
+  log_param_q_init: [4.09434, 4.09434]
+  # flg_loss_continuous defaults to auto (HQ: continuous KL on last native layer)
+  temperature:
+    min: 0.3
+```
+
+- `flg_loss_continuous: auto` — HQ-style (default if omitted).
+- `flg_loss_continuous: false` — all layers discrete-only (ablation).
+- Do **not** enable `progressive_coding` until L2 perplexity clearly falls.
+
+### Deferred (Tier B / C)
+
+Per-layer `kl_weight`, commitment / entropy penalties, detach coarse latent for L2, separate LR for `hier_quant`, perceptual/GAN loss, progressive ARELBO on M/L — try only after Tier A metrics look healthy on S.
 
 ## Known limitations
 

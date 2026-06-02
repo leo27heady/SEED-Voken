@@ -36,7 +36,11 @@ def compute_hier_elbo_loss(
             distortion = distortion + d_i
             mse = mse + mse_i
             log_dict_prog[f"loss/mse_progressive_L{i + 1}"] = mse_i.detach()
-        mse = mse / max(len(progressive_recs), 1)
+        denom = max(len(progressive_recs), 1)
+        # Keep progressive loss scale comparable to non-progressive training:
+        # average per-progressive-stage distortion/MSE instead of summing.
+        distortion = distortion / denom
+        mse = mse / denom
     else:
         distortion, mse = _arelbo_distortion(x, x_rec, progressive_noise_weight)
 

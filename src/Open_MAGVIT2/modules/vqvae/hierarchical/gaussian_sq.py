@@ -27,7 +27,11 @@ def calc_distance(z_continuous, codebook, dim_dict):
 
 
 class GaussianSQQuantizer(LayerQuantizer):
-    """5D stochastic quantizer (B, C, T, H, W) ported from HQ-VAE."""
+    """5D stochastic quantizer (B, C, T, H, W) ported from HQ-VAE.
+
+    Perplexity is exp(entropy) of the code distribution averaged over batch and (T, H, W),
+    in the range [1, size_dict] (uniform gives size_dict).
+    """
 
     def __init__(
         self,
@@ -104,14 +108,14 @@ class GaussianSQQuantizer(LayerQuantizer):
             z_q = torch.matmul(encodings, self.codebook).reshape(bs, t_len, h, w, dim_z)
 
         z_to_decoder = z_q.permute(0, 4, 1, 2, 3).contiguous()
-        kld_discrete = torch.sum(
-            prob_pos * (log_prob_pos - log_prob_pri), dim=(1, 2, 3, 4)
-        ).mean()
+        kld_discrete = (
+            prob_pos * (log_prob_pos - log_prob_pri)
+        ).mean(dim=(1, 2, 3, 4)).mean()
 
         if self.flg_loss_continuous:
             precision_sum = 1.0 / torch.clamp(var_q_pos.sum(), min=1e-10)
             kld_continuous = (
-                torch.sum((z - z_to_decoder) ** 2, dim=(1, 2, 3, 4))
+                (z - z_to_decoder).pow(2).mean(dim=(1, 2, 3, 4))
                 * (0.5 * precision_sum)
             ).mean()
             aux_loss = kld_discrete + kld_continuous
@@ -124,12 +128,21 @@ class GaussianSQQuantizer(LayerQuantizer):
         )
 
         posterior_var = var_main.detach() if torch.is_tensor(var_main) else var_main
+        active_codes = indices.unique().numel()
+        usage_fraction = float(active_codes) / float(self.size_dict)
         return QuantizerResult(
             z_q=z_to_decoder,
             aux_loss=aux_loss,
             perplexity=perplexity,
             indices=indices,
-            log_stats={"posterior_var": posterior_var, "avg_probs": avg_probs_k},
+            log_stats={
+                "posterior_var": posterior_var,
+                "avg_probs": avg_probs_k,
+                "active_codes": torch.tensor(active_codes, device=z.device, dtype=z.dtype),
+                "usage_fraction": torch.tensor(
+                    usage_fraction, device=z.device, dtype=z.dtype
+                ),
+            },
         )
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:

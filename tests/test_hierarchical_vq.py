@@ -5,7 +5,7 @@ import tempfile
 
 import torch
 
-from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
+from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel, _layer_codebook_usage_logs
 from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import Decoder, Encoder
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.factory import build_top_down
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.gaussian_sq import GaussianSQQuantizer
@@ -56,12 +56,98 @@ def test_gaussian_sq_forward_backward():
     assert out.z_q.shape == z.shape
 
 
+def test_perplexity_uniform_and_peaked():
+    k = 32
+    bs, t_len, h, w = 2, 3, 4, 4
+    uniform = torch.full((bs, t_len, h, w, k), 1.0 / k)
+    peaked = torch.zeros(bs, t_len, h, w, k)
+    peaked[..., 0] = 1.0
+
+    def _perplexity_from_prob(prob_pos):
+        p = prob_pos.mean(dim=(0, 1, 2, 3))
+        return torch.exp(-torch.sum(p * torch.log(p + 1e-7)))
+
+    ppx_uni = _perplexity_from_prob(uniform)
+    ppx_peak = _perplexity_from_prob(peaked)
+    assert abs(ppx_uni.item() - k) < 0.5
+    assert ppx_peak.item() < 1.5
+
+    q = GaussianSQQuantizer(size_dict=k, dim_dict=8)
+    z = torch.randn(bs, 8, t_len, h, w)
+    out_uni = q(z, var_q_pos=torch.tensor([60.0]), flg_train=False, flg_quant_det=True)
+    assert out_uni.perplexity.item() > k * 0.5
+
+
+def test_kld_discrete_mean_grid_invariant():
+    """Mean over (T,H,W) makes discrete KL independent of grid size for uniform posteriors."""
+    k = 16
+    var = torch.tensor([60.0])
+
+    def discrete_kl(t_len, h, w):
+        q = GaussianSQQuantizer(size_dict=k, dim_dict=8)
+        z = torch.randn(2, 8, t_len, h, w)
+        out = q(z, var_q_pos=var, flg_train=False, flg_quant_det=True)
+        return out.aux_loss.item()
+
+    kl_small = discrete_kl(2, 4, 4)
+    kl_large = discrete_kl(5, 16, 16)
+    assert abs(kl_small - kl_large) < 0.5 * max(abs(kl_small), abs(kl_large), 1.0)
+
+
 def test_gaussian_sq_perplexity_finite():
     q = GaussianSQQuantizer(size_dict=32, dim_dict=16)
     z = torch.randn(1, 16, 3, 8, 8)
     out = q(z, var_q_pos=torch.tensor([60.0]), flg_train=True)
     assert torch.isfinite(out.perplexity)
     assert out.perplexity.item() < 1e6
+
+
+def test_gaussian_sq_logs_active_codes():
+    q = GaussianSQQuantizer(size_dict=32, dim_dict=16)
+    z = torch.randn(2, 16, 3, 8, 8)
+    out = q(z, var_q_pos=torch.tensor([60.0]), flg_train=True)
+    ac = int(out.log_stats["active_codes"].item())
+    uf = float(out.log_stats["usage_fraction"].item())
+    assert 1 <= ac <= 32
+    assert abs(uf - ac / 32.0) < 1e-5
+
+
+def test_flg_loss_continuous_false_disables_continuous_kl():
+    hier_auto = build_top_down(
+        hierarchy_cfg=_native_hierarchy(64),
+        quantizer_cfg={
+            "type": "sq",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+            "flg_loss_continuous": "auto",
+        },
+        z_channels=64,
+        width=64,
+    )
+    assert hier_auto.blocks[1].quantizer.flg_loss_continuous is True
+
+    hier_off = build_top_down(
+        hierarchy_cfg=_native_hierarchy(64),
+        quantizer_cfg={
+            "type": "sq",
+            "size_dict": [64, 64],
+            "dim_dict": [64, 64],
+            "flg_loss_continuous": False,
+        },
+        z_channels=64,
+        width=64,
+    )
+    assert hier_off.blocks[0].quantizer.flg_loss_continuous is False
+    assert hier_off.blocks[1].quantizer.flg_loss_continuous is False
+
+
+def test_layer_codebook_usage_logs_helper():
+    q = GaussianSQQuantizer(size_dict=16, dim_dict=8)
+    z = torch.randn(1, 8, 3, 4, 4)
+    out = q(z, var_q_pos=torch.tensor([60.0]), flg_train=True)
+    logs = _layer_codebook_usage_logs([out], "train")
+    assert "train/active_codes_layer_1" in logs
+    assert "train/code_usage_frac_layer_1" in logs
 
 
 def test_gaussian_sq_prior_zero_vs_uniform():
@@ -336,7 +422,12 @@ def test_video_viz_grid_labels():
 
 if __name__ == "__main__":
     test_gaussian_sq_forward_backward()
+    test_perplexity_uniform_and_peaked()
+    test_kld_discrete_mean_grid_invariant()
     test_gaussian_sq_perplexity_finite()
+    test_gaussian_sq_logs_active_codes()
+    test_flg_loss_continuous_false_disables_continuous_kl()
+    test_layer_codebook_usage_logs_helper()
     test_gaussian_sq_prior_zero_vs_uniform()
     test_vq_indices_shape()
     test_lfq_adapter_with_projection()
