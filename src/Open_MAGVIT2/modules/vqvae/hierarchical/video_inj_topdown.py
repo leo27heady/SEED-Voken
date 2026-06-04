@@ -13,6 +13,7 @@ from src.Open_MAGVIT2.modules.vqvae.hierarchical.layer_string import (
     flatten_layer_specs,
     parse_blocks_sq,
 )
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.prior_net import GaussianPriorHead
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.quantizer_builder import build_layer_quantizer
 
 
@@ -36,6 +37,30 @@ def _tag_result(
     result.resolution_key = resolution_key
     result.grid_shape = grid_shape
     return result
+
+
+def _expand_scalar_or_list(value, num_layers: int, name: str):
+    if value is None:
+        return [0.0] * num_layers
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return [value[0]] * num_layers
+        if len(value) != num_layers:
+            raise ValueError(f"{name} length {len(value)} != num_layers {num_layers}")
+        return list(value)
+    return [value] * num_layers
+
+
+def _resolve_sq_prior_string(prior_cfg) -> str:
+    if isinstance(prior_cfg, dict):
+        mode = prior_cfg.get("mode", "zero").lower()
+    else:
+        mode = str(prior_cfg).lower()
+    if mode in ("learned", "learned_chain"):
+        return "learned"
+    if mode == "uniform":
+        return "uniform"
+    return "zero"
 
 
 def _codebook_size(quantizer: nn.Module) -> int:
@@ -83,17 +108,24 @@ class InjSQBlock(nn.Module):
         var_q: torch.Tensor,
         flg_train: bool,
         flg_quant_det: bool,
+        z_pri: Optional[torch.Tensor] = None,
+        var_q_pri: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, QuantizerResult]:
         z_pass = self.spatial_up(z_state)
         act = self.act_proj(activation)
         if act.shape[2:] != z_pass.shape[2:]:
             act = align_spatial(act, z_pass.shape[2:])
         z_feat = self.posterior(torch.cat([z_pass, act], dim=1))
+        q_kwargs = {}
+        if getattr(self.quantizer, "prior", None) == "learned":
+            q_kwargs["z_pri"] = z_pri
+            q_kwargs["var_q_pri"] = var_q_pri
         result = self.quantizer(
             z_feat,
             var_q_pos=var_q,
             flg_train=flg_train,
             flg_quant_det=flg_quant_det,
+            **q_kwargs,
         )
         z_state = z_pass + result.z_q
         return z_state, result
@@ -138,6 +170,8 @@ class SQResSQBlock(nn.Module):
         flg_train: bool,
         flg_quant_det: bool,
         layer_index: int,
+        z_pri: Optional[torch.Tensor] = None,
+        var_q_pri: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], QuantizerResult]:
         act = self.act_proj(activation)
         native_thw = act.shape[2:]
@@ -148,11 +182,16 @@ class SQResSQBlock(nn.Module):
             else:
                 z_on_act = align_spatial(z_latent, native_thw)
                 z_res = act - z_on_act
+            q_kwargs = {}
+            if getattr(self.quantizer, "prior", None) == "learned":
+                q_kwargs["z_pri"] = z_pri
+                q_kwargs["var_q_pri"] = var_q_pri
             result = self.quantizer(
                 z_res,
                 var_q_pos=var_q,
                 flg_train=flg_train,
                 flg_quant_det=flg_quant_det,
+                **q_kwargs,
             )
             z_latent = z_latent + fuse_to_latent(result.z_q, latent_thw)
             return z_latent, z_state, result
@@ -161,11 +200,16 @@ class SQResSQBlock(nn.Module):
             raise ValueError("pyramid mode requires z_state for ResSQ blocks")
         act_aligned = align_spatial(act, z_state.shape[2:])
         z_res = act_aligned - z_state
+        q_kwargs = {}
+        if getattr(self.quantizer, "prior", None) == "learned":
+            q_kwargs["z_pri"] = z_pri
+            q_kwargs["var_q_pri"] = var_q_pri
         result = self.quantizer(
             z_res,
             var_q_pos=var_q,
             flg_train=flg_train,
             flg_quant_det=flg_quant_det,
+            **q_kwargs,
         )
         z_state = z_state + result.z_q
         z_latent = z_latent + fuse_to_latent(result.z_q, latent_thw)
@@ -212,7 +256,23 @@ class SQVAE2TopDown(nn.Module):
             dim_dict = dim_dict * self.num_layers
 
         temp_init = quantizer_cfg.get("temperature", {}).get("init", 1.0)
-        prior = quantizer_cfg.get("prior", "zero")
+        prior_cfg = quantizer_cfg.get("prior", "zero")
+        sq_prior = _resolve_sq_prior_string(prior_cfg)
+        if isinstance(prior_cfg, dict):
+            self.prior_detach = bool(prior_cfg.get("detach_conditioning", False))
+            prior_width = int(prior_cfg.get("width", width))
+        else:
+            self.prior_detach = False
+            prior_width = width
+        self.use_learned_prior = sq_prior == "learned"
+        usage_reg_weights = _expand_scalar_or_list(
+            quantizer_cfg.get("usage_reg_weight", 0.0), self.num_layers, "usage_reg_weight"
+        )
+        usage_reg_targets = _expand_scalar_or_list(
+            quantizer_cfg.get("usage_reg_target_perplexity", 0.0),
+            self.num_layers,
+            "usage_reg_target_perplexity",
+        )
         lfq_sample = quantizer_cfg.get("sample_minimization_weight", 1.0)
         lfq_batch = quantizer_cfg.get("batch_maximization_weight", 1.0)
         log_init = quantizer_cfg.get("log_param_q_init", [4.09434] * self.num_layers)
@@ -234,6 +294,7 @@ class SQVAE2TopDown(nn.Module):
 
         lc_cfg = quantizer_cfg.get("flg_loss_continuous", "auto")
 
+        prior_heads = nn.ModuleDict()
         blocks = []
         for i, (res_key, upsample) in enumerate(layer_specs):
             act_ch = tap_channels.get(res_key, z_channels)
@@ -260,8 +321,19 @@ class SQVAE2TopDown(nn.Module):
                 commitment_weight=quantizer_cfg.get("commitment_weight", 0.25),
                 lfq_sample_min_weight=lfq_sample,
                 lfq_batch_max_weight=lfq_batch,
-                prior=prior,
+                prior=sq_prior if qtypes[i] == "sq" else "zero",
+                usage_reg_weight=usage_reg_weights[i],
+                usage_reg_target_perplexity=usage_reg_targets[i],
             )
+            if self.use_learned_prior and qtypes[i] == "sq":
+                # Conditioning tensors use act_proj → z_channels (see _compute_prior_fields).
+                if upsample:
+                    prior_in_ch = z_channels * 2
+                else:
+                    prior_in_ch = z_channels if i == 0 else z_channels * 2
+                prior_heads[str(i)] = GaussianPriorHead(
+                    prior_in_ch, dim_dict[i], width=prior_width
+                )
             if upsample:
                 if self.token_grid == "native":
                     raise ValueError(
@@ -285,6 +357,7 @@ class SQVAE2TopDown(nn.Module):
                     )
                 )
         self.blocks = nn.ModuleList(blocks)
+        self.prior_heads = prior_heads
 
         if self.token_grid == "pyramid" and not self.has_u2:
             raise ValueError("token_grid pyramid requires at least one u2 layer in blocks_sq")
@@ -323,6 +396,39 @@ class SQVAE2TopDown(nn.Module):
             return encoder_bottleneck.shape[2], encoder_bottleneck.shape[3], encoder_bottleneck.shape[4]
         return self._latent_thw(activations)
 
+    def _compute_prior_fields(
+        self,
+        layer_index: int,
+        act: torch.Tensor,
+        z_latent: torch.Tensor,
+        z_state: Optional[torch.Tensor],
+        block: nn.Module,
+        var_q: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        key = str(layer_index)
+        if key not in self.prior_heads:
+            return None, var_q
+        head = self.prior_heads[key]
+        if isinstance(block, InjSQBlock):
+            if z_state is None:
+                return None, var_q
+            z_pass = block.spatial_up(z_state)
+            act_a = block.act_proj(act)
+            if act_a.shape[2:] != z_pass.shape[2:]:
+                act_a = align_spatial(act_a, z_pass.shape[2:])
+            cond = torch.cat([z_pass, act_a], dim=1)
+        else:
+            act_a = block.act_proj(act)
+            if layer_index == 0:
+                cond = act_a
+            else:
+                cond = torch.cat(
+                    [align_spatial(z_latent, act_a.shape[2:]), act_a], dim=1
+                )
+        if self.prior_detach:
+            cond = cond.detach()
+        return head(cond), var_q
+
     def forward(
         self,
         activations: Union[Dict[str, torch.Tensor], torch.Tensor],
@@ -356,9 +462,18 @@ class SQVAE2TopDown(nn.Module):
             block = self.blocks[i]
             grid_shape = act.shape[2:]
 
+            z_pri, var_q_pri = self._compute_prior_fields(
+                i, act, z_latent, z_state, block, var_q
+            )
             if isinstance(block, InjSQBlock):
                 z_state, result = block(
-                    z_state, act, var_q, flg_train, flg_quant_det
+                    z_state,
+                    act,
+                    var_q,
+                    flg_train,
+                    flg_quant_det,
+                    z_pri=z_pri,
+                    var_q_pri=var_q_pri,
                 )
                 z_latent = z_latent + fuse_to_latent(
                     align_spatial(result.z_q, latent_thw), latent_thw
@@ -374,6 +489,8 @@ class SQVAE2TopDown(nn.Module):
                     flg_train,
                     flg_quant_det,
                     layer_index=i,
+                    z_pri=z_pri,
+                    var_q_pri=var_q_pri,
                 )
                 grid_shape = result.indices.shape[1:]
 
@@ -408,9 +525,18 @@ class SQVAE2TopDown(nn.Module):
             act = self._get_activation(activations, res_key)
             block = self.blocks[i]
 
+            z_pri, var_q_pri = self._compute_prior_fields(
+                i, act, z_latent, z_state, block, var_q
+            )
             if isinstance(block, InjSQBlock):
                 z_state, result = block(
-                    z_state, act, var_q, flg_train=flg_train, flg_quant_det=flg_quant_det
+                    z_state,
+                    act,
+                    var_q,
+                    flg_train=flg_train,
+                    flg_quant_det=flg_quant_det,
+                    z_pri=z_pri,
+                    var_q_pri=var_q_pri,
                 )
                 z_latent = z_latent + fuse_to_latent(
                     align_spatial(result.z_q, latent_thw), latent_thw
@@ -425,6 +551,8 @@ class SQVAE2TopDown(nn.Module):
                     flg_train=flg_train,
                     flg_quant_det=flg_quant_det,
                     layer_index=i,
+                    z_pri=z_pri,
+                    var_q_pri=var_q_pri,
                 )
             partial.append(z_latent.clone())
 

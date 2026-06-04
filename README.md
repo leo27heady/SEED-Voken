@@ -49,6 +49,7 @@ The project aims to provide advanced visual tokenizers for autoregressive visual
 ## 📖 Implementations
 
 - **Hierarchical video tokenizer (SQ-VAE-2 / RSQ on shape video):** [docs/Open-MAGVIT2-hierarchical-vq.md](./docs/Open-MAGVIT2-hierarchical-vq.md)
+- **Roadmap features (3–4 levels, learned priors, KL weights, optional GAN/perceptual):** [docs/HIERARCHICAL_VQ_ROADMAP_REPORT.md](./docs/HIERARCHICAL_VQ_ROADMAP_REPORT.md) — configs `shapes3d_sqvae2_128_S` (3-level), `shapes3d_sqvae2_64_S` (4-level), plus `shapes3d_sqvae2_64_S_smoke*.yaml` for quick validation. Video `sequence_length` must satisfy `T % 4 == 1` (64 S uses **T=13**); tap keys are literal `t{T}_h{H}_w{W}` from the encoder—run `audit_encoder_taps` before changing `hierarchy.blocks_sq`.
 
 **Our codebase supports both NPU and GPU for training and inference. All experiments were conducted using the Ascend 910B for training, and we validated our models on the V100. The observed performance between the two platforms is nearly identical.**
 

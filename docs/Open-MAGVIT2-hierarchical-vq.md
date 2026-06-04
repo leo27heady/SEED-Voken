@@ -258,30 +258,33 @@ This matches standard VQ-VAE codebook perplexity (not the 2D HQ logging variant)
 
 **Code:** discrete (and continuous) KL in [`gaussian_sq.py`](../src/Open_MAGVIT2/modules/vqvae/hierarchical/gaussian_sq.py) uses **mean over (T, H, W)** then mean over batch, so fine grids do not inflate `loss/kl_layer_2` by ~37k× vs coarse layers.
 
-**S training config** ([`shapes3d_sqvae2_128_S.yaml`](../configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_S.yaml)):
+**S training configs:**
+
+- [`shapes3d_sqvae2_128_S.yaml`](../configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_S.yaml) — 3-level @ 128 (`size_dict: [1024, 512, 256]`).
+- [`shapes3d_sqvae2_64_S.yaml`](../configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S.yaml) — 4-level @ 64, `sequence_length: 13` (audited taps; see roadmap report for plan-name mapping).
+
+Full option reference: [HIERARCHICAL_VQ_ROADMAP_REPORT.md](./HIERARCHICAL_VQ_ROADMAP_REPORT.md).
 
 ```yaml
 quantizer:
-  size_dict: [512, 512]
-  log_param_q_init: [4.09434, 4.09434]
-  # flg_loss_continuous defaults to auto (HQ: continuous KL on last native layer)
+  size_dict: [1024, 512, 256]
+  log_param_q_init: [4.09434, 4.09434, 4.09434]
   temperature:
     min: 0.3
+loss_cfg:
+  kl_weights: [0.5, 0.75, 1.0]   # optional
 ```
 
 - `flg_loss_continuous: auto` — HQ-style (default if omitted).
-- `flg_loss_continuous: false` — all layers discrete-only (ablation).
-- Do **not** enable `progressive_coding` until L2 perplexity clearly falls.
-
-### Deferred (Tier B / C)
-
-Per-layer `kl_weight`, commitment / entropy penalties, detach coarse latent for L2, separate LR for `hier_quant`, perceptual/GAN loss, progressive ARELBO on M/L — try only after Tier A metrics look healthy on S.
+- `quantizer.prior.mode: learned_chain` — optional learned categorical prior (see report).
+- `loss_cfg.perceptual` / `loss_cfg.gan` — optional recon losses on top of HQ-ELBO.
+- Do **not** enable `progressive_coding` until fine-level perplexity clearly falls.
 
 ## Known limitations
 
 - No HQ internal pixel decoder; MAGVIT decoder only.
-- No hierarchical prior chain (`z_pri`); SQ prior is `zero` or `uniform` only.
-- GAN / `vqgan` training path raises `NotImplementedError`.
+- Learned prior is a lightweight conv head (not full HQ pixel decoder stack).
+- Legacy `training_objective: vqgan` + `lossconfig` path is superseded by `loss_cfg` + `hq_elbo`.
 - `encode_tokens` / `decode_from_indices` for **sqvae2** and **rsqvae**; not all quantizer combos expose full index decode paths for LFQ experiments.
 - Progressive ARELBO adds extra decoder passes per step when enabled (memory/latency).
 

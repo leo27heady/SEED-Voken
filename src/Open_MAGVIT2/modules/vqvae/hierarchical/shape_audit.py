@@ -38,3 +38,28 @@ def format_tap_audit(audit: Dict[str, Tuple[int, ...]]) -> str:
         shape = audit[key]
         lines.append(f"  {key}: C={shape[1]}, T={shape[2]}, H={shape[3]}, W={shape[4]}")
     return "\n".join(lines)
+
+
+def validate_hierarchy_taps(
+    ddconfig: Dict[str, Any],
+    sequence_length: int,
+    resolution_keys: List[str],
+    tap_channels: Dict[str, int] = None,
+) -> Dict[str, Tuple[int, ...]]:
+    """Fail fast if ``blocks_sq`` keys are absent from the encoder tap dict."""
+    audit = audit_encoder_taps(ddconfig, sequence_length)
+    missing = [k for k in resolution_keys if k not in audit]
+    if missing:
+        raise ValueError(
+            "Hierarchy tap keys not produced by the encoder for this ddconfig / "
+            f"sequence_length={sequence_length}. Missing: {missing}. "
+            f"Available: {sorted(audit.keys())}.\n"
+            f"{format_tap_audit(audit)}"
+        )
+    if tap_channels:
+        for key, ch in tap_channels.items():
+            if key in audit and audit[key][1] != ch:
+                raise ValueError(
+                    f"tap_channels[{key!r}]={ch} but encoder produces C={audit[key][1]}"
+                )
+    return audit

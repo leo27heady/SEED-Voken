@@ -15,7 +15,31 @@ from src.Open_MAGVIT2.modules.scheduler.lr_scheduler import (
 )
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.factory import build_top_down, set_all_sq_temperature
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import QuantizerResult
+from src.Open_MAGVIT2.modules.losses.hier_video_loss import HierVideoReconLoss
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.hier_elbo_loss import compute_hier_elbo_loss
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import validate_hierarchy_taps
+
+
+def _as_float_list(value, name: str) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    return [float(value)]
+
+
+def _build_kl_weights_tensor(
+    kl_weights: Optional[List[float]], num_layers: int
+) -> Optional[torch.Tensor]:
+    if kl_weights is None:
+        return None
+    if len(kl_weights) == 1:
+        kl_weights = kl_weights * num_layers
+    if len(kl_weights) != num_layers:
+        raise ValueError(
+            f"loss.kl_weights length {len(kl_weights)} != num_layers {num_layers}"
+        )
+    return torch.tensor(kl_weights, dtype=torch.float32)
 
 
 def _layer_codebook_usage_logs(
@@ -65,9 +89,12 @@ class VideoHierVQModel(L.LightningModule):
         top_down_width: int = 64,
         progressive_coding: bool = False,
         progressive_noise_weight: float = 0.0,
+        loss_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["ddconfig", "hierarchy", "quantizer", "lossconfig"])
+        self.save_hyperparameters(
+            ignore=["ddconfig", "hierarchy", "quantizer", "lossconfig", "loss_cfg"]
+        )
 
         self.image_key = image_key
         self.training_objective = training_objective
@@ -88,6 +115,12 @@ class VideoHierVQModel(L.LightningModule):
         self.progressive_noise_weight = progressive_noise_weight
         self.automatic_optimization = False
 
+        loss_cfg = dict(loss_cfg or {})
+        self.loss_cfg = loss_cfg
+        num_layers_hint = len(
+            _as_float_list(quantizer.get("size_dict"), "size_dict") or [2]
+        )
+
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
         z_channels = ddconfig["z_channels"]
@@ -100,15 +133,54 @@ class VideoHierVQModel(L.LightningModule):
             z_channels=z_channels,
             width=top_down_width,
         )
+        tap_seq_len = hierarchy.get("sequence_length")
+        if (
+            tap_seq_len is not None
+            and self.hierarchy_mode == "sqvae2"
+            and hasattr(self.hier_quant, "resolution_keys")
+        ):
+            validate_hierarchy_taps(
+                ddconfig,
+                int(tap_seq_len),
+                list(self.hier_quant.resolution_keys),
+                hierarchy.get("tap_channels"),
+            )
+        if hasattr(self.hier_quant, "num_layers"):
+            num_layers_hint = self.hier_quant.num_layers
+        self.kl_weights = _build_kl_weights_tensor(
+            _as_float_list(loss_cfg.get("kl_weights"), "kl_weights"),
+            num_layers_hint,
+        )
 
         self.temp_cfg = dict(quantizer.get("temperature", {}))
         self.temp_init = self.temp_cfg.get("init", 1.0)
         self.temp_decay = self.temp_cfg.get("decay", 1e-5)
         self.temp_min = self.temp_cfg.get("min", 0.0)
 
+        perceptual_cfg = loss_cfg.get("perceptual", {})
+        gan_cfg = loss_cfg.get("gan", {})
+        self.perceptual_weight = float(
+            perceptual_cfg.get("weight", loss_cfg.get("perceptual_weight", 0.0))
+        )
+        self.use_perceptual = bool(
+            perceptual_cfg.get("enabled", self.perceptual_weight > 0)
+        )
+        self.use_gan_loss = bool(
+            gan_cfg.get("enabled", use_gan or loss_cfg.get("gan_enabled", False))
+        )
+        self.recon_loss = None
+        if self.use_perceptual or self.use_gan_loss:
+            self.recon_loss = HierVideoReconLoss(
+                perceptual_weight=self.perceptual_weight if self.use_perceptual else 0.0,
+                disc_start=int(gan_cfg.get("disc_start", loss_cfg.get("disc_start", 0))),
+                disc_weight=float(gan_cfg.get("weight", loss_cfg.get("disc_weight", 0.0))),
+                disc_factor=float(gan_cfg.get("disc_factor", 1.0)),
+                disc_loss=str(gan_cfg.get("disc_loss", "hinge")),
+                codebook_weight=float(loss_cfg.get("codebook_weight", 0.0)),
+            )
+
         self.loss = None
-        if use_gan:
-            assert lossconfig is not None, "lossconfig required when use_gan=True"
+        if use_gan and lossconfig is not None:
             self.loss = instantiate_from_config(lossconfig)
 
         if self.use_ema:
@@ -269,33 +341,92 @@ class VideoHierVQModel(L.LightningModule):
                 wp_it = self.wp_iter
             self.lr_annealing(self.learning_rate, g_it, wp_it, max_it, wp0=self.wp0, wpe=self.wpe)
 
-        if self.use_gan and self.training_objective == "vqgan":
+        if (
+            self.recon_loss is not None
+            and getattr(self.recon_loss, "use_discriminator", False)
+        ):
             opt_gen, opt_disc = self.optimizers()
-            # GAN path not used in v1 default configs
-            raise NotImplementedError("vqgan training path not wired in v1")
+            kl_w = self.kl_weights
+            if kl_w is not None:
+                kl_w = kl_w.to(x.device)
+            base_loss, log_dict = compute_hier_elbo_loss(
+                x,
+                x_rec,
+                layer_results,
+                progressive_recs=progressive_recs,
+                progressive_noise_weight=self.progressive_noise_weight,
+                kl_weights=kl_w,
+            )
+            codebook_loss = log_dict["loss/kl_total"]
+            recon_extra, recon_log = self.recon_loss(
+                x,
+                x_rec,
+                codebook_loss,
+                optimizer_idx=0,
+                global_step=self.global_step,
+                last_layer=self.get_last_layer(),
+                split="train",
+            )
+            loss = base_loss + recon_extra
+            log_dict.update(recon_log)
+            log_dict.update(_layer_codebook_usage_logs(layer_results, "train"))
+            opt_gen.zero_grad()
+            self.manual_backward(loss)
+            opt_gen.step()
+
+            discloss, disc_log = self.recon_loss(
+                x,
+                x_rec,
+                codebook_loss,
+                optimizer_idx=1,
+                global_step=self.global_step,
+                split="train",
+            )
+            opt_disc.zero_grad()
+            self.manual_backward(discloss)
+            opt_disc.step()
+            log_dict.update(disc_log)
         else:
             opt = self.optimizers()
+            kl_w = self.kl_weights
+            if kl_w is not None:
+                kl_w = kl_w.to(x.device)
             loss, log_dict = compute_hier_elbo_loss(
                 x,
                 x_rec,
                 layer_results,
                 progressive_recs=progressive_recs,
                 progressive_noise_weight=self.progressive_noise_weight,
+                kl_weights=kl_w,
             )
+            if self.use_perceptual and self.recon_loss is not None:
+                codebook_loss = log_dict["loss/kl_total"]
+                p_extra, p_log = self.recon_loss(
+                    x,
+                    x_rec,
+                    codebook_loss,
+                    optimizer_idx=0,
+                    global_step=self.global_step,
+                    last_layer=self.get_last_layer(),
+                    split="train",
+                )
+                loss = loss + p_extra
+                log_dict.update(p_log)
             log_dict.update(_layer_codebook_usage_logs(layer_results, "train"))
             opt.zero_grad()
             self.manual_backward(loss)
             opt.step()
-            log_dict["train/temperature"] = torch.tensor(
-                max(self.temp_min, self.temp_init * math.exp(-self.temp_decay * self.global_step))
-            )
-            self.log_dict(
-                {k: v for k, v in log_dict.items()},
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
+
+        log_dict["train/temperature"] = torch.tensor(
+            max(self.temp_min, self.temp_init * math.exp(-self.temp_decay * self.global_step))
+        )
+        self.log_dict(
+            {k: v for k, v in log_dict.items()},
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
 
     def validation_step(self, batch, batch_idx):
         if self.use_ema:
@@ -307,7 +438,7 @@ class VideoHierVQModel(L.LightningModule):
     def _validation_step(self, batch, batch_idx, suffix=""):
         x = self.get_input(batch, self.image_key)
         x_rec, layer_results = self(x, flg_train=False, flg_quant_det=True)
-        loss, log_dict = compute_hier_elbo_loss(x, x_rec, layer_results)
+        loss, log_dict = compute_hier_elbo_loss(x, x_rec, layer_results, kl_weights=self.kl_weights)
         log_dict.update(_layer_codebook_usage_logs(layer_results, f"val{suffix}"))
         log_dict = {f"val{suffix}/{k.split('/', 1)[-1]}": v for k, v in log_dict.items()}
         self.log_dict(log_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True)
@@ -327,9 +458,12 @@ class VideoHierVQModel(L.LightningModule):
             else:
                 cur_lr = 1.0
         cur_lr *= peak_lr
-        opt = self.optimizers()
-        for param_group in opt.param_groups:
-            param_group["lr"] = cur_lr * param_group.get("lr_sc", 1)
+        opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+        for opt in opts:
+            for param_group in opt.param_groups:
+                param_group["lr"] = cur_lr * param_group.get("lr_sc", 1)
 
     def configure_optimizers(self):
         params = (
@@ -337,8 +471,18 @@ class VideoHierVQModel(L.LightningModule):
             + list(self.decoder.parameters())
             + list(self.hier_quant.parameters())
         )
-        opt = torch.optim.Adam(params, lr=self.learning_rate, betas=(0.5, 0.9))
-        return opt
+        opt_gen = torch.optim.Adam(params, lr=self.learning_rate, betas=(0.5, 0.9))
+        if (
+            self.recon_loss is not None
+            and getattr(self.recon_loss, "use_discriminator", False)
+        ):
+            opt_disc = torch.optim.Adam(
+                self.recon_loss.discriminator.parameters(),
+                lr=self.learning_rate,
+                betas=(0.5, 0.9),
+            )
+            return [opt_gen, opt_disc]
+        return opt_gen
 
     def get_last_layer(self):
         return self.decoder.conv_out.conv_1.weight
@@ -347,8 +491,14 @@ class VideoHierVQModel(L.LightningModule):
         x = self.get_input(batch, self.image_key).to(self.device)
         x_rec, _ = self(x, flg_train=False, flg_quant_det=True)
         log = {"inputs": x, "reconstructions": x_rec.clamp(-1, 1)}
-        progressive = self.decode_progressive(x, flg_quant_det=True)
-        for i, x_prog in enumerate(progressive):
-            label = f"progressive_L{i + 1}" if i == 0 else f"progressive_L1-L{i + 1}"
-            log[label] = x_prog
+
+        # Only generate progressive rows when progressive coding is enabled; this
+        # keeps non-progressive runs focused on GT vs reconstruction grids and
+        # avoids decoding untrained partial latents.
+        if self.progressive_coding:
+            progressive = self.decode_progressive(x, flg_quant_det=True)
+            for i, x_prog in enumerate(progressive):
+                label = f"progressive_L{i + 1}" if i == 0 else f"progressive_L1-L{i + 1}"
+                log[label] = x_prog
+
         return log

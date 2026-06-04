@@ -160,6 +160,98 @@ def test_gaussian_sq_prior_zero_vs_uniform():
     assert out_z.aux_loss.item() != out_u.aux_loss.item()
 
 
+def test_gaussian_sq_learned_prior():
+    z = torch.randn(1, 16, 3, 4, 4)
+    z_pri = torch.randn(1, 16, 3, 4, 4)
+    var = torch.tensor([60.0])
+    q = GaussianSQQuantizer(32, 16, prior="learned")
+    out = q(z, var_q_pos=var, z_pri=z_pri, var_q_pri=var, flg_train=True)
+    assert torch.isfinite(out.aux_loss)
+
+
+def test_kl_weights_scaling():
+    x = torch.randn(1, 3, 2, 8, 8)
+    x_rec = x + 0.1 * torch.randn_like(x)
+    q = GaussianSQQuantizer(16, 8)
+    var = torch.tensor([60.0])
+    z = torch.randn(1, 8, 2, 4, 4)
+    r1 = q(z, var_q_pos=var, flg_train=True)
+    r2 = q(z, var_q_pos=var, flg_train=True)
+    w = torch.tensor([1.0, 3.0])
+    _, log = compute_hier_elbo_loss(x, x_rec, [r1, r2], kl_weights=w)
+    assert abs(log["loss/kl_layer_2"].item() - 3.0 * r2.aux_loss.item()) < 1e-4
+    assert abs(log["loss/kl_layer_1_raw"].item() - r1.aux_loss.item()) < 1e-4
+
+
+def test_usage_regularizer_active():
+    q = GaussianSQQuantizer(
+        32, 16, usage_reg_weight=0.5, usage_reg_target_perplexity=10.0
+    )
+    z = torch.randn(1, 16, 3, 8, 8)
+    out = q(z, var_q_pos=torch.tensor([60.0]), flg_train=True)
+    q_off = GaussianSQQuantizer(32, 16)
+    out_off = q_off(z, var_q_pos=torch.tensor([60.0]), flg_train=True)
+    assert out.aux_loss.item() > out_off.aux_loss.item()
+
+
+def test_sqvae2_three_levels_forward_shapes():
+    hier = build_top_down(
+        hierarchy_cfg={
+            "mode": "sqvae2",
+            "token_grid": "native",
+            "latent_key": "t3_h16_w16",
+            "blocks_sq": "t3_h16_w16_x1,t5_h32_w32_x1,t9_h64_w64_x1",
+            "tap_channels": {
+                "t3_h16_w16": 64,
+                "t5_h32_w32": 64,
+                "t9_h64_w64": 128,
+            },
+        },
+        quantizer_cfg={
+            "type": "sq",
+            "prior": "zero",
+            "size_dict": [64, 64, 64],
+            "dim_dict": [32, 32, 32],
+            "log_param_q_init": [4.09434, 4.09434, 4.09434],
+        },
+        z_channels=32,
+        width=32,
+    )
+    assert hier.num_layers == 3
+    acts = {
+        "t3_h16_w16": torch.randn(1, 64, 3, 16, 16),
+        "t5_h32_w32": torch.randn(1, 64, 5, 32, 32),
+        "t9_h64_w64": torch.randn(1, 128, 9, 64, 64),
+    }
+    h = torch.randn(1, 32, 3, 16, 16)
+    z_q, results = hier(acts, encoder_bottleneck=h, flg_train=True)
+    assert z_q.shape == h.shape
+    assert len(results) == 3
+
+
+def test_sqvae2_learned_prior_chain_builds_heads():
+    hier = build_top_down(
+        hierarchy_cfg={
+            "mode": "sqvae2",
+            "token_grid": "native",
+            "latent_key": "t3_h16_w16",
+            "blocks_sq": "t3_h16_w16_x1,t5_h32_w32_x1",
+            "tap_channels": {"t3_h16_w16": 64, "t5_h32_w32": 64},
+        },
+        quantizer_cfg={
+            "type": "sq",
+            "prior": {"mode": "learned_chain", "width": 16},
+            "size_dict": [32, 32],
+            "dim_dict": [16, 16],
+            "log_param_q_init": [4.09434, 4.09434],
+        },
+        z_channels=64,
+        width=16,
+    )
+    assert len(hier.prior_heads) == 2
+    assert hier.blocks[0].quantizer.prior == "learned"
+
+
 def test_vq_indices_shape():
     q = DeterministicVQQuantizer(512, 64)
     z = torch.randn(1, 64, 3, 16, 16)
@@ -366,6 +458,7 @@ def test_encode_tokens_api():
             "log_param_q_init": [4.09434, 4.09434],
         },
         use_ema=False,
+        progressive_coding=True,
     )
     x = torch.randn(1, 3, 5, 64, 64)
     tok = model.encode_tokens(x)
@@ -398,13 +491,90 @@ def test_video_hier_vq_model_forward_and_log_images():
     batch = {"video": x}
     log = model.log_images(batch)
     assert log["inputs"].shape == x.shape
-    assert any(k.startswith("progressive_") for k in log)
+    has_progressive = any(k.startswith("progressive_") for k in log)
+    if model.progressive_coding:
+        assert has_progressive
 
 
 def test_shape_audit_t5_64():
     audit = audit_encoder_taps(_ddconfig(64), sequence_length=5)
     assert "t2_h8_w8" in audit
     assert "t5_h64_w64" in audit
+
+
+def test_shape_audit_four_level_64_S_taps():
+    """Tap keys in shapes3d_sqvae2_64_S (T=13) must exist on the encoder."""
+    from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import (
+        validate_hierarchy_taps,
+    )
+
+    dd = dict(
+        double_z=False,
+        z_channels=32,
+        resolution=64,
+        in_channels=3,
+        out_ch=3,
+        ch=64,
+        ch_mult=[1, 2, 2, 4],
+        num_res_blocks=2,
+    )
+    keys = [
+        "t4_h8_w8",
+        "t7_h16_w16",
+        "t13_h32_w32",
+        "t13_h64_w64",
+    ]
+    taps = {
+        "t4_h8_w8": 32,
+        "t7_h16_w16": 128,
+        "t13_h32_w32": 128,
+        "t13_h64_w64": 64,
+    }
+    validate_hierarchy_taps(dd, 13, keys, taps)
+
+
+def test_validate_hierarchy_taps_rejects_plan_style_names():
+    """Roadmap-style names (t3_h4_w4, …) are not valid unless the encoder emits them."""
+    from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import (
+        validate_hierarchy_taps,
+    )
+
+    dd = dict(
+        double_z=False,
+        z_channels=32,
+        resolution=64,
+        in_channels=3,
+        out_ch=3,
+        ch=64,
+        ch_mult=[1, 2, 2, 4],
+        num_res_blocks=2,
+    )
+    try:
+        validate_hierarchy_taps(
+            dd,
+            13,
+            ["t3_h4_w4", "t5_h8_w8", "t9_h16_w16", "t13_h32_w32"],
+        )
+        raise AssertionError("expected ValueError for missing tap keys")
+    except ValueError as e:
+        assert "Missing" in str(e) or "t3_h4_w4" in str(e)
+
+
+def test_hier_video_recon_loss_perceptual_and_gan():
+    from src.Open_MAGVIT2.modules.losses.hier_video_loss import HierVideoReconLoss
+
+    x = torch.randn(1, 3, 5, 32, 32, requires_grad=True)
+    x_rec = x + 0.05 * torch.randn_like(x)
+    loss_mod = HierVideoReconLoss(
+        perceptual_weight=0.1, disc_start=0, disc_weight=0.5
+    )
+    cb = torch.tensor(0.0)
+    last = torch.randn(1, 64, 3, 4, 4, requires_grad=True)
+    g_loss, g_log = loss_mod(x, x_rec, cb, 0, 0, last_layer=last)
+    d_loss, d_log = loss_mod(x, x_rec, cb, 1, 0)
+    assert torch.isfinite(g_loss)
+    assert torch.isfinite(d_loss)
+    assert "train/perceptual" in g_log
 
 
 def test_video_viz_grid_labels():
@@ -429,6 +599,11 @@ if __name__ == "__main__":
     test_flg_loss_continuous_false_disables_continuous_kl()
     test_layer_codebook_usage_logs_helper()
     test_gaussian_sq_prior_zero_vs_uniform()
+    test_gaussian_sq_learned_prior()
+    test_kl_weights_scaling()
+    test_usage_regularizer_active()
+    test_sqvae2_three_levels_forward_shapes()
+    test_sqvae2_learned_prior_chain_builds_heads()
     test_vq_indices_shape()
     test_lfq_adapter_with_projection()
     test_rsq_topdown_end_to_end()

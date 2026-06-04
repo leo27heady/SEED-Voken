@@ -25,6 +25,7 @@ def compute_hier_elbo_loss(
     layer_results: List[QuantizerResult],
     progressive_recs: Optional[List[torch.Tensor]] = None,
     progressive_noise_weight: float = 0.0,
+    kl_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """ARELBO distortion + sum of layer aux losses (HQ-VAE)."""
     log_dict_prog: Dict[str, torch.Tensor] = {}
@@ -50,9 +51,21 @@ def compute_hier_elbo_loss(
         "loss/mse": mse.detach(),
         **log_dict_prog,
     }
+    num_layers = len(layer_results)
+    if kl_weights is None:
+        kl_weights = torch.ones(num_layers, device=x.device, dtype=x.dtype)
+    else:
+        if kl_weights.numel() != num_layers:
+            raise ValueError(
+                f"kl_weights length {kl_weights.numel()} != num_layers {num_layers}"
+            )
+        kl_weights = kl_weights.to(x.device, dtype=x.dtype)
     for i, result in enumerate(layer_results):
-        kl_total = kl_total + result.aux_loss
-        log_dict[f"loss/kl_layer_{i + 1}"] = result.aux_loss.detach()
+        raw_kl = result.aux_loss
+        weighted_kl = kl_weights[i] * raw_kl
+        kl_total = kl_total + weighted_kl
+        log_dict[f"loss/kl_layer_{i + 1}_raw"] = raw_kl.detach()
+        log_dict[f"loss/kl_layer_{i + 1}"] = weighted_kl.detach()
         log_dict[f"train/perplexity_layer_{i + 1}"] = result.perplexity.detach()
         if "posterior_var" in result.log_stats:
             pv = result.log_stats["posterior_var"]

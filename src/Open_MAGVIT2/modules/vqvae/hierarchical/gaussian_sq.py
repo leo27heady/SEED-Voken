@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -31,6 +33,11 @@ class GaussianSQQuantizer(LayerQuantizer):
 
     Perplexity is exp(entropy) of the code distribution averaged over batch and (T, H, W),
     in the range [1, size_dict] (uniform gives size_dict).
+
+    Prior modes (``prior`` string):
+    - ``zero``: log p_prior = 0 (legacy HQ default).
+    - ``uniform``: log p_prior = log(1/K).
+    - ``learned``: requires ``z_pri`` (and optional ``var_q_pri``) at forward time.
     """
 
     def __init__(
@@ -40,6 +47,8 @@ class GaussianSQQuantizer(LayerQuantizer):
         flg_loss_continuous: bool = False,
         temperature: float = 1.0,
         prior: str = "zero",
+        usage_reg_weight: float = 0.0,
+        usage_reg_target_perplexity: float = 0.0,
     ):
         super().__init__()
         self.size_dict = size_dict
@@ -47,10 +56,42 @@ class GaussianSQQuantizer(LayerQuantizer):
         self.temperature = temperature
         self.flg_loss_continuous = flg_loss_continuous
         self.prior = prior.lower()
+        self.usage_reg_weight = float(usage_reg_weight)
+        self.usage_reg_target_perplexity = float(usage_reg_target_perplexity)
         self.codebook = nn.Parameter(torch.randn(size_dict, dim_dict))
 
     def set_temperature(self, tau: float) -> None:
         self.temperature = tau
+
+    def _log_prob_prior(
+        self,
+        prob_pos: torch.Tensor,
+        logit_pos: torch.Tensor,
+        z_pri: Optional[torch.Tensor],
+        var_q_pri: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.prior in ("zero", "none"):
+            return torch.zeros_like(logit_pos)
+        if self.prior == "uniform":
+            return torch.log(torch.full_like(prob_pos, 1.0 / self.size_dict))
+        if self.prior == "learned":
+            if z_pri is None:
+                raise ValueError("prior='learned' requires z_pri")
+            bs, dim_z, t_len, h, w = z_pri.shape
+            z_pri_perm = z_pri.permute(0, 2, 3, 4, 1).contiguous()
+            if var_q_pri is None:
+                var_q_pri = torch.tensor(1.0, device=z_pri.device, dtype=z_pri.dtype)
+            if torch.numel(var_q_pri) > 1:
+                var_main = var_q_pri.reshape(-1)[0]
+            else:
+                var_main = var_q_pri
+            precision_pri = 1.0 / torch.clamp(var_main, min=1e-10)
+            distances_pri = calc_distance(z_pri_perm, self.codebook, self.dim_dict)
+            logit_pri = (-0.5 * precision_pri * distances_pri).reshape(
+                bs, t_len, h, w, self.size_dict
+            )
+            return F.log_softmax(logit_pri, dim=-1)
+        raise ValueError(f"Unknown prior mode: {self.prior}")
 
     def forward(
         self,
@@ -59,6 +100,8 @@ class GaussianSQQuantizer(LayerQuantizer):
         var_q_pos: torch.Tensor = None,
         flg_train: bool = True,
         flg_quant_det: bool = False,
+        z_pri: Optional[torch.Tensor] = None,
+        var_q_pri: Optional[torch.Tensor] = None,
     ) -> QuantizerResult:
         if var_q_pos is None:
             raise ValueError("GaussianSQQuantizer requires var_q_pos")
@@ -76,12 +119,7 @@ class GaussianSQQuantizer(LayerQuantizer):
         )
         prob_pos = F.softmax(logit_pos, dim=-1)
         log_prob_pos = F.log_softmax(logit_pos, dim=-1)
-        if self.prior == "zero":
-            log_prob_pri = torch.zeros_like(log_prob_pos)
-        else:
-            log_prob_pri = torch.log(
-                torch.full_like(prob_pos, 1.0 / self.size_dict)
-            )
+        log_prob_pri = self._log_prob_prior(prob_pos, logit_pos, z_pri, var_q_pri)
 
         if flg_train:
             indices = torch.argmax(logit_pos, dim=-1)
@@ -108,6 +146,11 @@ class GaussianSQQuantizer(LayerQuantizer):
             z_q = torch.matmul(encodings, self.codebook).reshape(bs, t_len, h, w, dim_z)
 
         z_to_decoder = z_q.permute(0, 4, 1, 2, 3).contiguous()
+        avg_probs_k = prob_pos.mean(dim=(0, 1, 2, 3))
+        perplexity = torch.exp(
+            -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
+        )
+
         kld_discrete = (
             prob_pos * (log_prob_pos - log_prob_pri)
         ).mean(dim=(1, 2, 3, 4)).mean()
@@ -122,10 +165,11 @@ class GaussianSQQuantizer(LayerQuantizer):
         else:
             aux_loss = kld_discrete
 
-        avg_probs_k = prob_pos.mean(dim=(0, 1, 2, 3))
-        perplexity = torch.exp(
-            -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
-        )
+        if self.usage_reg_weight > 0.0 and self.usage_reg_target_perplexity > 0.0:
+            usage_reg = self.usage_reg_weight * (
+                (perplexity - self.usage_reg_target_perplexity) ** 2
+            )
+            aux_loss = aux_loss + usage_reg
 
         posterior_var = var_main.detach() if torch.is_tensor(var_main) else var_main
         active_codes = indices.unique().numel()
