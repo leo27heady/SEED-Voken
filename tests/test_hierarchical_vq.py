@@ -30,10 +30,10 @@ def _ddconfig(resolution=64):
 
 def _native_hierarchy(resolution=64, latent_key=None):
     if resolution == 64:
-        coarse, fine = "t2_h8_w8", "t5_h64_w64"
+        coarse, fine = "h8_w8", "h64_w64"
         taps = {coarse: 64, fine: 128}
     else:
-        coarse, fine = "t3_h16_w16", "t9_h64_w64"
+        coarse, fine = "h16_w16", "h64_w64"
         taps = {coarse: 64, fine: 256}
     if latent_key is None:
         latent_key = coarse
@@ -199,12 +199,12 @@ def test_sqvae2_three_levels_forward_shapes():
         hierarchy_cfg={
             "mode": "sqvae2",
             "token_grid": "native",
-            "latent_key": "t3_h16_w16",
-            "blocks_sq": "t3_h16_w16_x1,t5_h32_w32_x1,t9_h64_w64_x1",
+            "latent_key": "h16_w16",
+            "blocks_sq": "h16_w16_x1,h32_w32_x1,h64_w64_x1",
             "tap_channels": {
-                "t3_h16_w16": 64,
-                "t5_h32_w32": 64,
-                "t9_h64_w64": 128,
+                "h16_w16": 64,
+                "h32_w32": 64,
+                "h64_w64": 128,
             },
         },
         quantizer_cfg={
@@ -219,9 +219,9 @@ def test_sqvae2_three_levels_forward_shapes():
     )
     assert hier.num_layers == 3
     acts = {
-        "t3_h16_w16": torch.randn(1, 64, 3, 16, 16),
-        "t5_h32_w32": torch.randn(1, 64, 5, 32, 32),
-        "t9_h64_w64": torch.randn(1, 128, 9, 64, 64),
+        "h16_w16": torch.randn(1, 64, 3, 16, 16),
+        "h32_w32": torch.randn(1, 64, 5, 32, 32),
+        "h64_w64": torch.randn(1, 128, 9, 64, 64),
     }
     h = torch.randn(1, 32, 3, 16, 16)
     z_q, results = hier(acts, encoder_bottleneck=h, flg_train=True)
@@ -326,9 +326,9 @@ def test_pyramid_progressive_matches_forward():
         hierarchy_cfg={
             "mode": "sqvae2",
             "token_grid": "pyramid",
-            "latent_key": "t2_h8_w8",
-            "blocks_sq": "t2_h8_w8_x1,t5_h64_w64_u2",
-            "tap_channels": {"t2_h8_w8": 64, "t5_h64_w64": 128},
+            "latent_key": "h8_w8",
+            "blocks_sq": "h8_w8_x1,h64_w64_u2",
+            "tap_channels": {"h8_w8": 64, "h64_w64": 128},
         },
         quantizer_cfg={
             "type": "sq",
@@ -498,12 +498,12 @@ def test_video_hier_vq_model_forward_and_log_images():
 
 def test_shape_audit_t5_64():
     audit = audit_encoder_taps(_ddconfig(64), sequence_length=5)
-    assert "t2_h8_w8" in audit
-    assert "t5_h64_w64" in audit
+    assert "h8_w8" in audit
+    assert "h64_w64" in audit
 
 
-def test_shape_audit_four_level_64_S_taps():
-    """Tap keys in shapes3d_sqvae2_64_S (T=13) must exist on the encoder."""
+def test_shape_audit_three_level_64_v2_taps():
+    """Spatial tap keys for shapes3d_sqvae2_64_S_v2 (T=13, 3-level)."""
     from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import (
         validate_hierarchy_taps,
     )
@@ -518,17 +518,11 @@ def test_shape_audit_four_level_64_S_taps():
         ch_mult=[1, 2, 2, 4],
         num_res_blocks=2,
     )
-    keys = [
-        "t4_h8_w8",
-        "t7_h16_w16",
-        "t13_h32_w32",
-        "t13_h64_w64",
-    ]
+    keys = ["h8_w8", "h16_w16", "h32_w32"]
     taps = {
-        "t4_h8_w8": 32,
-        "t7_h16_w16": 128,
-        "t13_h32_w32": 128,
-        "t13_h64_w64": 64,
+        "h8_w8": 32,
+        "h16_w16": 128,
+        "h32_w32": 128,
     }
     validate_hierarchy_taps(dd, 13, keys, taps)
 

@@ -5,6 +5,10 @@ from typing import Any, Dict, List, Tuple
 import torch
 
 from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import Encoder
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.tap_keys import (
+    normalize_resolution_key,
+    spatial_keys_in_audit,
+)
 
 
 def audit_encoder_taps(
@@ -14,7 +18,7 @@ def audit_encoder_taps(
     resolution: int = None,
 ) -> Dict[str, Tuple[int, ...]]:
     """
-    Run a dry encoder forward and return tap key -> tensor shape (B, C, T, H, W).
+    Run a dry encoder forward and return spatial tap key -> tensor shape (B, C, T, H, W).
     """
     if sequence_length % 4 != 1:
         raise ValueError(
@@ -33,7 +37,7 @@ def audit_encoder_taps(
 
 
 def format_tap_audit(audit: Dict[str, Tuple[int, ...]]) -> str:
-    lines = ["Encoder intermediate taps:"]
+    lines = ["Encoder intermediate taps (spatial keys):"]
     for key in sorted(audit.keys()):
         shape = audit[key]
         lines.append(f"  {key}: C={shape[1]}, T={shape[2]}, H={shape[3]}, W={shape[4]}")
@@ -45,10 +49,12 @@ def validate_hierarchy_taps(
     sequence_length: int,
     resolution_keys: List[str],
     tap_channels: Dict[str, int] = None,
+    tap_key_format: str = "spatial",
 ) -> Dict[str, Tuple[int, ...]]:
     """Fail fast if ``blocks_sq`` keys are absent from the encoder tap dict."""
     audit = audit_encoder_taps(ddconfig, sequence_length)
-    missing = [k for k in resolution_keys if k not in audit]
+    normalized_keys = [normalize_resolution_key(k) for k in resolution_keys]
+    missing = [k for k in normalized_keys if k not in audit]
     if missing:
         raise ValueError(
             "Hierarchy tap keys not produced by the encoder for this ddconfig / "
@@ -58,8 +64,21 @@ def validate_hierarchy_taps(
         )
     if tap_channels:
         for key, ch in tap_channels.items():
-            if key in audit and audit[key][1] != ch:
+            nk = normalize_resolution_key(key)
+            if nk in audit and audit[nk][1] != ch:
                 raise ValueError(
-                    f"tap_channels[{key!r}]={ch} but encoder produces C={audit[key][1]}"
+                    f"tap_channels[{key!r}]={ch} but encoder produces C={audit[nk][1]}"
                 )
     return audit
+
+
+def audit_spatial_taps_at_lengths(
+    ddconfig: Dict[str, Any],
+    sequence_lengths: List[int],
+    resolution: int = None,
+) -> Dict[int, Dict[str, Tuple[int, ...]]]:
+    """Audit spatial keys at multiple clip lengths (prefix-stability checks)."""
+    return {
+        t: audit_encoder_taps(ddconfig, t, resolution=resolution)
+        for t in sequence_lengths
+    }

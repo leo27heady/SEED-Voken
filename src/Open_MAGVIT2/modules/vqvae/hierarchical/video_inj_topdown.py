@@ -9,6 +9,10 @@ from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import (
     Upsampler,
 )
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import QuantizerResult
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.tap_keys import (
+    normalize_resolution_key,
+    resolve_activation_key,
+)
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.layer_string import (
     flatten_layer_specs,
     parse_blocks_sq,
@@ -240,7 +244,8 @@ class SQVAE2TopDown(nn.Module):
         latent_key = hierarchy_cfg.get("latent_key")
         if latent_key is None:
             latent_key = self.resolution_keys[0]
-        self.latent_key = latent_key
+        self.latent_key = normalize_resolution_key(latent_key)
+        self.tap_key_format = hierarchy_cfg.get("tap_key_format", "spatial").lower()
         if latent_key not in self.resolution_keys and hierarchy_cfg.get("tap_channels"):
             pass
         tap_channels = hierarchy_cfg.get("tap_channels", {})
@@ -371,20 +376,13 @@ class SQVAE2TopDown(nn.Module):
         activations: Dict[str, torch.Tensor],
         key: str,
     ) -> torch.Tensor:
-        if key not in activations:
-            available = ", ".join(sorted(activations.keys()))
-            raise KeyError(
-                f"Activation key '{key}' not found. Available: {available}"
-            )
-        return activations[key]
+        resolved = resolve_activation_key(
+            activations, key, tap_key_format=self.tap_key_format
+        )
+        return activations[resolved]
 
     def _latent_thw(self, activations: Dict[str, torch.Tensor]) -> Tuple[int, int, int]:
-        if self.latent_key not in activations:
-            raise KeyError(
-                f"latent_key '{self.latent_key}' not in encoder activations. "
-                f"Available: {sorted(activations.keys())}"
-            )
-        act = activations[self.latent_key]
+        act = self._get_activation(activations, self.latent_key)
         return act.shape[2], act.shape[3], act.shape[4]
 
     def _resolve_latent_thw(

@@ -144,6 +144,7 @@ class VideoHierVQModel(L.LightningModule):
                 int(tap_seq_len),
                 list(self.hier_quant.resolution_keys),
                 hierarchy.get("tap_channels"),
+                tap_key_format=hierarchy.get("tap_key_format", "spatial"),
             )
         if hasattr(self.hier_quant, "num_layers"):
             num_layers_hint = self.hier_quant.num_layers

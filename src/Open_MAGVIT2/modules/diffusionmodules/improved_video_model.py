@@ -1,3 +1,4 @@
+from src.Open_MAGVIT2.modules.diffusionmodules.norm import FrameWiseGroupNorm
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -85,8 +86,8 @@ class ResBlock(nn.Module):
         self.use_agn = use_agn
 
         if not use_agn: ## agn is GroupNorm likewise skip it if has agn before
-            self.norm1 = nn.GroupNorm(32, in_filters, eps=1e-6)
-        self.norm2 = nn.GroupNorm(32, out_filters, eps=1e-6)
+            self.norm1 = FrameWiseGroupNorm(32, in_filters, eps=1e-6)
+        self.norm2 = FrameWiseGroupNorm(32, out_filters, eps=1e-6)
 
         self.conv1 = ConvBlock3D(in_filters, out_filters, kernel_size=(3, 3, 3), causal=True, padding=1, bias=False)
         self.conv2 = ConvBlock3D(out_filters, out_filters, kernel_size=(3, 3, 3), causal=True, padding=1, bias=False)
@@ -166,13 +167,13 @@ class Encoder(nn.Module):
             self.mid_block.append(ResBlock(block_in, block_in))
         
         ### end
-        self.norm_out = nn.GroupNorm(32, block_out, eps=1e-6)
+        self.norm_out = FrameWiseGroupNorm(32, block_out, eps=1e-6)
         self.conv_out = ConvBlock3D(block_out, z_channels, kernel_size=(1, 1, 1), causal=True)
 
     @staticmethod
     def _shape_key(x: torch.Tensor) -> str:
-        t, h, w = x.shape[2], x.shape[3], x.shape[4]
-        return f"t{t}_h{h}_w{w}"
+        h, w = x.shape[3], x.shape[4]
+        return f"h{h}_w{w}"
 
     def forward(self, x, return_intermediates: bool = False):
         activations = {}
@@ -244,7 +245,7 @@ class Decoder(nn.Module):
                     up.upsample = Upsampler(block_in, block_size=(2, 2, 2))
             self.up.insert(0, up)
         
-        self.norm_out = nn.GroupNorm(32, block_in, eps=1e-6)
+        self.norm_out = FrameWiseGroupNorm(32, block_in, eps=1e-6)
 
         self.conv_out = ConvBlock3D(block_in, out_ch, kernel_size=(3, 3, 3), causal=True, padding=1)
     
@@ -335,60 +336,40 @@ class Upsampler(nn.Module):
                 out = out[:, :, [0], ...] #only take the first frame
         return out
 
-class AdaptiveGroupNorm(nn.Module):
-    def __init__(self, z_channel, in_filters, num_groups=32, eps=1e-6):
+class FrameWiseVideoAdaptiveGroupNorm(nn.Module):
+    """Adaptive GroupNorm with per-frame style pooling (video v2)."""
+
+    def __init__(self, z_channel: int, in_filters: int, num_groups: int = 32, eps: float = 1e-6):
         super().__init__()
-        self.gn = nn.GroupNorm(num_groups=32, num_channels=in_filters, eps=eps, affine=False)
+        self.gn = FrameWiseGroupNorm(num_groups, in_filters, eps=eps)
         self.gamma = nn.Linear(z_channel, in_filters)
         self.beta = nn.Linear(z_channel, in_filters)
         self.eps = eps
-    
-    def forward(self, x, quantizer):
-        B, C, _, _ = x.shape
-        ### calcuate var for scale
-        scale = rearrange(quantizer, "b c h w -> b c (h w)")
-        scale = scale.var(dim=-1) + self.eps #not unbias
-        scale = scale.sqrt()
-        scale = self.gamma(scale).view(B, C, 1, 1)
 
-        ### calculate mean for bias
-        bias = rearrange(quantizer, "b c h w -> b c (h w)")
-        bias = bias.mean(dim=-1)
-        bias = self.beta(bias).view(B, C, 1, 1)
-       
-        x = self.gn(x)
-        x = scale * x + bias
-
-        return x
-
-class AdaptiveGroupNorm(nn.Module):
-    def __init__(self, z_channel, in_filters, num_groups=32, eps=1e-6):
-        super().__init__()
-        self.gn = nn.GroupNorm(num_groups=32, num_channels=in_filters, eps=eps, affine=False)
-        self.gamma = nn.Linear(z_channel, in_filters)
-        self.beta = nn.Linear(z_channel, in_filters)
-        self.eps = eps
-    
-    def forward(self, x, quantizer):
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         """
-        input: [B C T H W]
+        x: [B, C, T, H, W]
+        style: [B, C_z, T', H', W'] — interpolated to x grid when shapes differ
         """
-        B, C, _, _, _ = x.shape
-        ### calcuate var for scale
-        scale = rearrange(quantizer, "b c t h w -> b c (t h w)")
-        scale = scale.var(dim=-1) + self.eps #not unbias
+        b, c, t, h, w = x.shape
+        if style.shape[2:] != (t, h, w):
+            style = F.interpolate(
+                style, size=(t, h, w), mode="trilinear", align_corners=False
+            )
+        style_hw = style.permute(0, 2, 1, 3, 4).reshape(b * t, style.shape[1], h, w)
+        scale = style_hw.var(dim=(-2, -1), unbiased=False) + self.eps
         scale = scale.sqrt()
-        scale = self.gamma(scale).view(B, C, 1, 1, 1)
+        scale = self.gamma(scale).view(b, t, c, 1, 1).permute(0, 2, 1, 3, 4)
 
-        ### calculate mean for bias
-        bias = rearrange(quantizer, "b c t h w -> b c (t h w)")
-        bias = bias.mean(dim=-1)
-        bias = self.beta(bias).view(B, C, 1, 1, 1)
-       
+        bias = style_hw.mean(dim=(-2, -1))
+        bias = self.beta(bias).view(b, t, c, 1, 1).permute(0, 2, 1, 3, 4)
+
         x = self.gn(x)
-        x = scale * x + bias
+        return scale * x + bias
 
-        return x
+
+# Backward-compatible alias (2D path unused in video decoder forward)
+AdaptiveGroupNorm = FrameWiseVideoAdaptiveGroupNorm
 
 if __name__ == "__main__":
     x = torch.randn(size = (2, 3, 17, 128, 128))
