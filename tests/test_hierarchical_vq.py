@@ -56,6 +56,22 @@ def test_gaussian_sq_forward_backward():
     assert out.z_q.shape == z.shape
 
 
+def test_gaussian_sq_large_codebook_with_in_channels_proj():
+    """in_channels != dim_dict: any size_dict must not break distance reshape."""
+    bs, t_len, h, w = 16, 3, 4, 4
+    q = GaussianSQQuantizer(
+        size_dict=4096,
+        dim_dict=96,
+        in_channels=16,
+        flg_loss_continuous=True,
+    )
+    z = torch.randn(bs, 16, t_len, h, w, requires_grad=True)
+    out = q(z, var_q_pos=torch.tensor([60.0]), flg_train=True, flg_quant_det=True)
+    out.aux_loss.backward()
+    assert out.z_q.shape == z.shape
+    assert out.indices.shape == (bs, t_len, h, w)
+
+
 def test_perplexity_uniform_and_peaked():
     k = 32
     bs, t_len, h, w = 2, 3, 4, 4

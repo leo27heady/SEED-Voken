@@ -18,8 +18,14 @@ def gumbel_softmax_sample(logits, temperature):
     return F.softmax((logits + g) / temperature, dim=-1)
 
 
-def calc_distance(z_continuous, codebook, dim_dict):
-    z_flat = z_continuous.reshape(-1, dim_dict)
+def calc_distance(z_continuous, codebook):
+    """Pairwise squared L2 distance; z_continuous last dim must match codebook dim."""
+    feat_dim = z_continuous.shape[-1]
+    if feat_dim != codebook.shape[1]:
+        raise ValueError(
+            f"z feature dim {feat_dim} != codebook dim {codebook.shape[1]}"
+        )
+    z_flat = z_continuous.reshape(-1, feat_dim)
     distances = (
         torch.sum(z_flat ** 2, dim=1, keepdim=True)
         + torch.sum(codebook ** 2, dim=1)
@@ -49,16 +55,34 @@ class GaussianSQQuantizer(LayerQuantizer):
         prior: str = "zero",
         usage_reg_weight: float = 0.0,
         usage_reg_target_perplexity: float = 0.0,
+        in_channels: int | None = None,
     ):
         super().__init__()
         self.size_dict = size_dict
         self.dim_dict = dim_dict
+        self.in_channels = int(in_channels if in_channels is not None else dim_dict)
         self.temperature = temperature
         self.flg_loss_continuous = flg_loss_continuous
         self.prior = prior.lower()
         self.usage_reg_weight = float(usage_reg_weight)
         self.usage_reg_target_perplexity = float(usage_reg_target_perplexity)
         self.codebook = nn.Parameter(torch.randn(size_dict, dim_dict))
+        if self.in_channels != dim_dict:
+            self.in_proj = nn.Conv3d(self.in_channels, dim_dict, kernel_size=1)
+            self.out_proj = nn.Conv3d(dim_dict, self.in_channels, kernel_size=1)
+        else:
+            self.in_proj = None
+            self.out_proj = None
+
+    def _to_codebook_space(self, z: torch.Tensor) -> torch.Tensor:
+        if self.in_proj is not None:
+            return self.in_proj(z)
+        return z
+
+    def _from_codebook_space(self, z_q: torch.Tensor) -> torch.Tensor:
+        if self.out_proj is not None:
+            return self.out_proj(z_q)
+        return z_q
 
     def set_temperature(self, tau: float) -> None:
         self.temperature = tau
@@ -86,7 +110,12 @@ class GaussianSQQuantizer(LayerQuantizer):
             else:
                 var_main = var_q_pri
             precision_pri = 1.0 / torch.clamp(var_main, min=1e-10)
-            distances_pri = calc_distance(z_pri_perm, self.codebook, self.dim_dict)
+            if z_pri_perm.shape[-1] != self.dim_dict:
+                raise ValueError(
+                    "learned prior z_pri must already be in codebook dim "
+                    f"({self.dim_dict}), got {z_pri_perm.shape[-1]}"
+                )
+            distances_pri = calc_distance(z_pri_perm, self.codebook)
             logit_pri = (-0.5 * precision_pri * distances_pri).reshape(
                 bs, t_len, h, w, self.size_dict
             )
@@ -105,15 +134,16 @@ class GaussianSQQuantizer(LayerQuantizer):
     ) -> QuantizerResult:
         if var_q_pos is None:
             raise ValueError("GaussianSQQuantizer requires var_q_pos")
-        bs, dim_z, t_len, h, w = z.shape
-        z_pos = z.permute(0, 2, 3, 4, 1).contiguous()
+        bs, _, t_len, h, w = z.shape
+        z_cb = self._to_codebook_space(z)
+        z_pos = z_cb.permute(0, 2, 3, 4, 1).contiguous()
 
         if torch.numel(var_q_pos) > 1:
             var_main = var_q_pos[-1]
         else:
             var_main = var_q_pos
         precision = 1.0 / torch.clamp(var_main, min=1e-10)
-        distances = calc_distance(z_pos, self.codebook, self.dim_dict)
+        distances = calc_distance(z_pos, self.codebook)
         logit_pos = (-0.5 * precision * distances).reshape(
             bs, t_len, h, w, self.size_dict
         )
@@ -126,7 +156,7 @@ class GaussianSQQuantizer(LayerQuantizer):
             encodings = gumbel_softmax_sample(logit_pos, self.temperature)
             z_q = torch.matmul(
                 encodings.reshape(-1, self.size_dict), self.codebook
-            ).reshape(bs, t_len, h, w, dim_z)
+            ).reshape(bs, t_len, h, w, self.dim_dict)
             avg_probs = torch.mean(prob_pos.detach(), dim=0)
         else:
             if flg_quant_det:
@@ -143,9 +173,12 @@ class GaussianSQQuantizer(LayerQuantizer):
                     self.codebook
                 )
                 avg_probs = torch.mean(prob_pos, dim=0)
-            z_q = torch.matmul(encodings, self.codebook).reshape(bs, t_len, h, w, dim_z)
+            z_q = torch.matmul(encodings, self.codebook).reshape(
+                bs, t_len, h, w, self.dim_dict
+            )
 
-        z_to_decoder = z_q.permute(0, 4, 1, 2, 3).contiguous()
+        z_cb_out = z_q.permute(0, 4, 1, 2, 3).contiguous()
+        z_to_decoder = self._from_codebook_space(z_cb_out)
         avg_probs_k = prob_pos.mean(dim=(0, 1, 2, 3))
         perplexity = torch.exp(
             -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
@@ -194,4 +227,5 @@ class GaussianSQQuantizer(LayerQuantizer):
         flat = indices.reshape(-1)
         encodings = F.one_hot(flat, num_classes=self.size_dict).type_as(self.codebook)
         z_q = torch.matmul(encodings, self.codebook).reshape(bs, t_len, h, w, self.dim_dict)
-        return z_q.permute(0, 4, 1, 2, 3).contiguous()
+        z_cb = z_q.permute(0, 4, 1, 2, 3).contiguous()
+        return self._from_codebook_space(z_cb)

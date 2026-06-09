@@ -329,6 +329,7 @@ class SQVAE2TopDown(nn.Module):
                 prior=sq_prior if qtypes[i] == "sq" else "zero",
                 usage_reg_weight=usage_reg_weights[i],
                 usage_reg_target_perplexity=usage_reg_targets[i],
+                in_channels=z_channels,
             )
             if self.use_learned_prior and qtypes[i] == "sq":
                 # Conditioning tensors use act_proj → z_channels (see _compute_prior_fields).

@@ -33,6 +33,7 @@ def build_layer_quantizer(
     prior: str = "zero",
     usage_reg_weight: float = 0.0,
     usage_reg_target_perplexity: float = 0.0,
+    in_channels: int | None = None,
 ) -> nn.Module:
     qtype = qtype.lower()
     if qtype == "sq":
@@ -44,12 +45,14 @@ def build_layer_quantizer(
             prior=prior,
             usage_reg_weight=usage_reg_weight,
             usage_reg_target_perplexity=usage_reg_target_perplexity,
+            in_channels=in_channels,
         )
     if qtype == "vq":
         return DeterministicVQQuantizer(
             size_dict=size_dict,
             dim_dict=dim_dict,
             commitment_weight=commitment_weight,
+            in_channels=in_channels,
         )
     if qtype == "lfq":
         return LFQAdapter(

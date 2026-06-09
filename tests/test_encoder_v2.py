@@ -7,7 +7,7 @@ import torch
 
 from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
 from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import Decoder, Encoder
-from src.Open_MAGVIT2.modules.diffusionmodules.norm import FrameWiseGroupNorm
+from src.Open_MAGVIT2.modules.diffusionmodules.norm import FrameWiseGroupNorm, resolve_num_groups
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.layer_string import parse_blocks_sq
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import audit_encoder_taps
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.tap_keys import normalize_resolution_key
@@ -54,6 +54,19 @@ def test_ev2_01_frame_wise_group_norm_shape():
     x = torch.randn(2, 64, 5, 8, 8)
     y = norm(x)
     assert y.shape == x.shape
+
+
+def test_ev2_num_groups_configurable():
+    assert resolve_num_groups(8, 32) == 8
+    assert resolve_num_groups(8, 16) == 8
+    assert resolve_num_groups(8, 24) == 8
+    enc = Encoder(
+        ch=16, out_ch=3, in_channels=3, num_res_blocks=1, z_channels=16,
+        ch_mult=[1, 2, 2, 4], resolution=32, num_groups=8,
+    )
+    x = torch.randn(1, 3, 9, 32, 32)
+    y = enc(x)
+    assert y.shape[-2:] == (4, 4)
 
 
 def test_ev2_04_spatial_keys_only():

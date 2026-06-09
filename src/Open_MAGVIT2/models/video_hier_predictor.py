@@ -189,6 +189,6 @@ class VideoHierPredictorModel(L.LightningModule):
         return loss_ar
 
     def configure_optimizers(self):
-        params = [p for p in self.orchestrator.parameters() if p.requires_grad]
-        params += [p for p in self.predictor_stages.parameters() if p.requires_grad]
+        # orchestrator.stages aliases predictor_stages — dedupe param groups.
+        params = [p for p in self.predictor_stages.parameters() if p.requires_grad]
         return torch.optim.AdamW(params, lr=self.lr)

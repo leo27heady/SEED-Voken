@@ -77,6 +77,7 @@ class ResBlock(nn.Module):
                  out_filters,
                  use_conv_shortcut = False,
                  use_agn = False,
+                 num_groups: int = 32,
                  ) -> None:
         super().__init__()
 
@@ -86,8 +87,8 @@ class ResBlock(nn.Module):
         self.use_agn = use_agn
 
         if not use_agn: ## agn is GroupNorm likewise skip it if has agn before
-            self.norm1 = FrameWiseGroupNorm(32, in_filters, eps=1e-6)
-        self.norm2 = FrameWiseGroupNorm(32, out_filters, eps=1e-6)
+            self.norm1 = FrameWiseGroupNorm(num_groups, in_filters, eps=1e-6)
+        self.norm2 = FrameWiseGroupNorm(num_groups, out_filters, eps=1e-6)
 
         self.conv1 = ConvBlock3D(in_filters, out_filters, kernel_size=(3, 3, 3), causal=True, padding=1, bias=False)
         self.conv2 = ConvBlock3D(out_filters, out_filters, kernel_size=(3, 3, 3), causal=True, padding=1, bias=False)
@@ -120,13 +121,14 @@ class ResBlock(nn.Module):
     
 class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4), 
-                resolution, double_z=False,
+                resolution, double_z=False, num_groups: int = 32,
                 ):
         super().__init__()
 
         self.in_channels = in_channels
         self.z_channels = z_channels
         self.resolution = resolution
+        self.num_groups = num_groups
 
         self.num_res_blocks = num_res_blocks
         self.num_blocks = len(ch_mult)
@@ -148,7 +150,7 @@ class Encoder(nn.Module):
             block_in = ch*in_ch_mult[i_level] #[1, 1, 2, 2, 4]
             block_out = ch*ch_mult[i_level] #[1, 2, 2, 4]
             for _ in range(self.num_res_blocks):
-                block.append(ResBlock(block_in, block_out))
+                block.append(ResBlock(block_in, block_out, num_groups=self.num_groups))
                 block_in = block_out
             
             down = nn.Module()
@@ -164,10 +166,10 @@ class Encoder(nn.Module):
         ### mid
         self.mid_block = nn.ModuleList()
         for res_idx in range(self.num_res_blocks):
-            self.mid_block.append(ResBlock(block_in, block_in))
+            self.mid_block.append(ResBlock(block_in, block_in, num_groups=self.num_groups))
         
         ### end
-        self.norm_out = FrameWiseGroupNorm(32, block_out, eps=1e-6)
+        self.norm_out = FrameWiseGroupNorm(self.num_groups, block_out, eps=1e-6)
         self.conv_out = ConvBlock3D(block_out, z_channels, kernel_size=(1, 1, 1), causal=True)
 
     @staticmethod
@@ -205,7 +207,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4), 
-                resolution, double_z=False,) -> None:
+                resolution, double_z=False, num_groups: int = 32) -> None:
         super().__init__()
 
         self.ch = ch
@@ -213,6 +215,7 @@ class Decoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.num_groups = num_groups
 
         block_in = ch*ch_mult[self.num_blocks-1]
 
@@ -222,7 +225,7 @@ class Decoder(nn.Module):
 
         self.mid_block = nn.ModuleList()
         for res_idx in range(self.num_res_blocks):
-            self.mid_block.append(ResBlock(block_in, block_in))
+            self.mid_block.append(ResBlock(block_in, block_in, num_groups=self.num_groups))
         
         self.up = nn.ModuleList()
 
@@ -231,9 +234,9 @@ class Decoder(nn.Module):
         for i_level in reversed(range(self.num_blocks)):
             block = nn.ModuleList()
             block_out = ch*ch_mult[i_level]
-            self.adaptive.insert(0, AdaptiveGroupNorm(z_channels, block_in))
+            self.adaptive.insert(0, AdaptiveGroupNorm(z_channels, block_in, num_groups=self.num_groups))
             for i_block in range(self.num_res_blocks):
-                block.append(ResBlock(block_in, block_out))
+                block.append(ResBlock(block_in, block_out, num_groups=self.num_groups))
                 block_in = block_out
             
             up = nn.Module()
@@ -245,7 +248,7 @@ class Decoder(nn.Module):
                     up.upsample = Upsampler(block_in, block_size=(2, 2, 2))
             self.up.insert(0, up)
         
-        self.norm_out = FrameWiseGroupNorm(32, block_in, eps=1e-6)
+        self.norm_out = FrameWiseGroupNorm(self.num_groups, block_in, eps=1e-6)
 
         self.conv_out = ConvBlock3D(block_in, out_ch, kernel_size=(3, 3, 3), causal=True, padding=1)
     
