@@ -212,3 +212,43 @@ def test_ev2_10_partial_load_conv_only():
 def test_normalize_resolution_key():
     assert normalize_resolution_key("h8_w8") == "h8_w8"
     assert normalize_resolution_key("t3_h8_w8") == "h8_w8"
+
+
+def _ddconfig_v4():
+    return dict(
+        double_z=False,
+        z_channels=32,
+        resolution=64,
+        in_channels=3,
+        out_ch=3,
+        ch=64,
+        ch_mult=[1, 2, 2, 2, 2],
+        num_res_blocks=2,
+        num_groups=32,
+    )
+
+
+def _hierarchy_v4():
+    return dict(
+        mode="sqvae2",
+        token_grid="native",
+        tap_key_format="spatial",
+        sequence_length=17,
+        latent_key="h4_w4",
+        blocks_sq="h4_w4_x1,h8_w8_x1,h16_w16_x1,h32_w32_x1",
+        tap_channels=dict(h4_w4=32, h8_w8=128, h16_w16=128, h32_w32=128),
+    )
+
+
+def test_ev2_04_v4_hierarchy_taps():
+    from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import validate_hierarchy_taps
+
+    dd = _ddconfig_v4()
+    hier = _hierarchy_v4()
+    audit = validate_hierarchy_taps(
+        dd, 17, ["h4_w4", "h8_w8", "h16_w16", "h32_w32"], hier["tap_channels"]
+    )
+    assert audit["h4_w4"][2] == 3
+    assert audit["h8_w8"][2] == 5
+    assert audit["h16_w16"][2] == 9
+    assert audit["h32_w32"][2] == 17

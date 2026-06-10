@@ -114,3 +114,41 @@ def test_stg_factorized_forward():
     masks = _bot_masks(sched, t_len=9)
     out = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=9)
     assert torch.isfinite(out.logits).all()
+
+
+def test_stg_04_parent_dim_cross_attn_smoke():
+    """Child stage dim != parent_dim; cross-attn K/V projection must work."""
+    from src.Open_MAGVIT2.modules.predictor.parent_condition import ParentCondition
+
+    sched = PyramidSchedule.from_v4_64s()
+    stage = PredictorStage(
+        dim=256,
+        n_heads=8,
+        n_layers=1,
+        codebook_size=1024,
+        h=8,
+        w=8,
+        max_t=17,
+        max_shifts=8,
+        has_parent=True,
+        parent_dim=384,
+    )
+    t_len = 5
+    n_sp = 64
+    ctx = torch.randn(1, t_len * n_sp, 256)
+    parent_o1 = torch.randn(1, 3 * 16, 384)
+    parent_o2 = torch.randn(1, 3 * 16, 384)
+    parent = ParentCondition.from_shift_output(parent_o1, parent_o2)
+    builder = PyramidMaskBuilder(sched)
+    self_m = builder.build_self_attn_mask(1, 3, ctx.device)
+    n = ctx.shape[1]
+    cross_m = builder.build_cross_attn_mask(1, 0, device=ctx.device)
+    masks = ShiftMasks(
+        self_attn=self_m[:n, :n],
+        cross_attn=cross_m[:n, : parent_o1.shape[1]],
+    )
+    out = stage.execute_shift(
+        0, context_embed=ctx, stream_state=None, parent=parent, masks=masks, t_len=t_len,
+    )
+    assert out.logits.shape == (1, n, 1024)
+    assert torch.isfinite(out.logits).all()

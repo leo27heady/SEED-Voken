@@ -1,0 +1,98 @@
+seed_everything: true
+trainer:
+  accelerator: cpu
+  devices: 1
+  precision: 32
+  max_epochs: 2
+  limit_train_batches: 4
+  limit_val_batches: 2
+  num_sanity_val_steps: 0
+  log_every_n_steps: 1
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_64_S_v4_smoke
+  enable_checkpointing: false
+  logger: false
+
+model:
+  class_path: src.Open_MAGVIT2.models.video_hier_vqgan.VideoHierVQModel
+  init_args:
+    progressive_coding: false
+    ddconfig:
+      double_z: False
+      z_channels: 32
+      resolution: 64
+      in_channels: 3
+      out_ch: 3
+      ch: 64
+      ch_mult: [1, 2, 2, 2, 2]
+      num_res_blocks: 2
+      num_groups: 32
+    hierarchy:
+      mode: sqvae2
+      token_grid: native
+      tap_key_format: spatial
+      sequence_length: 17
+      latent_key: h4_w4
+      blocks_sq: "h4_w4_x1,h8_w8_x1,h16_w16_x1,h32_w32_x1"
+      tap_channels:
+        h4_w4: 32
+        h8_w8: 128
+        h16_w16: 128
+        h32_w32: 128
+    quantizer:
+      type: sq
+      prior: zero
+      size_dict: [256, 256, 256, 256]
+      dim_dict: [32, 32, 32, 32]
+      log_param_q_init: [4.09434, 4.09434, 4.09434, 4.09434]
+      temperature:
+        init: 1.0
+        decay: 1.0e-5
+        min: 0.3
+    learning_rate: 1.0e-4
+    training_objective: hq_elbo
+    use_gan: false
+    use_ema: false
+    top_down_width: 32
+    scheduler_type: "None"
+    sche_type: cos
+    wpe: 0.01
+    wp: 0
+    wp0: 0.0
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 2
+    num_workers: 0
+    train:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 64
+          mode: train
+          sequence_length: 17
+          dataset_size: 8
+          cache: false
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 3
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+    validation:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 64
+          mode: validation
+          sequence_length: 17
+          dataset_size: 4
+          cache: false
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 3
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+
+ckpt_path: null

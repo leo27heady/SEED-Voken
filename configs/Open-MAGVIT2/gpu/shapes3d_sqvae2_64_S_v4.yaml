@@ -1,0 +1,144 @@
+seed_everything: true
+trainer:
+  accelerator: gpu
+  strategy: auto
+  devices: 1
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: 2000
+  check_val_every_n_epoch: 4
+  num_sanity_val_steps: -1
+  log_every_n_steps: 100
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_64_S_v4
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_64_S_v4"
+        monitor: val_ema/mse
+        mode: min
+        save_top_k: 3
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: src.Open_MAGVIT2.callbacks.video_reconstruction_logger.VideoReconstructionLogger
+      init_args:
+        every_n_epochs: 1
+        max_samples: 2
+        log_wandb: true
+        save_dir: reconstructions
+        cell_size: 96
+    - class_path: src.Open_MAGVIT2.callbacks.nan_guard.NanGuardCallback
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: seed-voken-shapes3d
+      name: sqvae2_64_S_v4
+      save_dir: ../../results/vqgan/
+
+model:
+  class_path: src.Open_MAGVIT2.models.video_hier_vqgan.VideoHierVQModel
+  init_args:
+    progressive_coding: false
+    ddconfig:
+      double_z: False
+      z_channels: 32
+      resolution: 64
+      in_channels: 3
+      out_ch: 3
+      ch: 64
+      ch_mult: [1, 2, 2, 2, 2]
+      num_res_blocks: 2
+      num_groups: 32
+    hierarchy:
+      mode: sqvae2
+      token_grid: native
+      tap_key_format: spatial
+      sequence_length: 17
+      latent_key: h4_w4
+      blocks_sq: "h4_w4_x1,h8_w8_x1,h16_w16_x1,h32_w32_x1"
+      tap_channels:
+        h4_w4: 32
+        h8_w8: 128
+        h16_w16: 128
+        h32_w32: 128
+    quantizer:
+      type: sq
+      prior: zero
+      # Smaller books than [4096,...] — matches stable v2 scale; quantizer input is z_channels=32.
+      size_dict: [2048, 1024, 512, 384]
+      dim_dict: [32, 32, 32, 32]
+      log_param_q_init: [4.09434, 4.09434, 4.09434, 4.09434]
+      temperature:
+        init: 1.0
+        decay: 1.0e-5
+        min: 0.3
+    learning_rate: 1.0e-4
+    numerical_debug: true
+    training_objective: hq_elbo
+    use_gan: false
+    use_ema: true
+    top_down_width: 32
+    scheduler_type: "None"
+    sche_type: cos
+    wpe: 0.01
+    wp: 2
+    wp0: 0.0
+    max_iter:
+    wp_iter:
+    resume_lr:
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 8
+    num_workers: 8
+    train:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 64
+          mode: train
+          sequence_length: 17
+          dataset_size: 10000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    validation:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 64
+          mode: validation
+          sequence_length: 17
+          dataset_size: 500
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    test:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 64
+          mode: test
+          sequence_length: 17
+          dataset_size: 500
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+
+ckpt_path: null

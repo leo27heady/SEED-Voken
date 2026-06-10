@@ -124,3 +124,24 @@ def test_from_encoder_audit_v2():
         dd, hierarchy, quant, t_context=9, t_total=13
     )
     assert sched.native_t(2) == 13
+
+
+def test_rf_11_from_encoder_audit_v4():
+    dd = dict(
+        double_z=False, z_channels=32, resolution=64, in_channels=3, out_ch=3,
+        ch=64, ch_mult=[1, 2, 2, 2, 2], num_res_blocks=2,
+    )
+    hierarchy = dict(
+        blocks_sq="h4_w4_x1,h8_w8_x1,h16_w16_x1,h32_w32_x1",
+    )
+    quant = dict(
+        size_dict=[2048, 1024, 512, 512],
+        dim_dict=[384, 256, 192, 128],
+    )
+    sched = PyramidSchedule.from_encoder_audit(
+        dd, hierarchy, quant, t_context=9, t_total=17
+    )
+    assert sched.S == 4
+    assert [sched.native_t(s) for s in range(4)] == [3, 5, 9, 17]
+    assert [sched.shifts_per_stage(s) for s in range(4)] == [1, 2, 4, 8]
+    assert sched.required_total_frames(9) == 17

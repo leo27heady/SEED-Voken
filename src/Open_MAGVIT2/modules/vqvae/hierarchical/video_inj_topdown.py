@@ -8,6 +8,7 @@ from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import (
     ConvBlock3D,
     Upsampler,
 )
+from src.Open_MAGVIT2.modules.numerical_debug import check_tensor, numerical_debug_enabled
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import QuantizerResult
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.tap_keys import (
     normalize_resolution_key,
@@ -494,6 +495,17 @@ class SQVAE2TopDown(nn.Module):
                 grid_shape = result.indices.shape[1:]
 
             results.append(_tag_result(result, res_key, grid_shape))
+            if numerical_debug_enabled():
+                layer = i + 1
+                check_tensor(
+                    f"hier/L{layer}_{res_key}/z_latent",
+                    z_latent,
+                    extra={"var_q": float(var_q[-1].item())},
+                )
+                check_tensor(
+                    f"hier/L{layer}_{res_key}/aux_loss",
+                    result.aux_loss.reshape(1),
+                )
 
         return z_latent, results
 

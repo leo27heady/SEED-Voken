@@ -246,6 +246,17 @@ class PyramidSchedule:
         return cls(stages, links, t_context=t_context, t_total=t_total)
 
     @classmethod
+    def from_v4_64s(cls, t_context: int = 9, t_total: int = 17) -> "PyramidSchedule":
+        stages = (
+            StageSpec("h4_w4", 4, 4, 2048, 384),
+            StageSpec("h8_w8", 8, 8, 1024, 256),
+            StageSpec("h16_w16", 16, 16, 512, 192),
+            StageSpec("h32_w32", 32, 32, 512, 128),
+        )
+        links = (DownsampleLink(), DownsampleLink(), DownsampleLink())
+        return cls(stages, links, t_context=t_context, t_total=t_total)
+
+    @classmethod
     def from_stage_specs(
         cls,
         stages: Sequence[StageSpec],

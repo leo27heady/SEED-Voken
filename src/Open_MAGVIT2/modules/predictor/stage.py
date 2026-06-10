@@ -30,6 +30,7 @@ class PredictorStage(nn.Module):
         n_heads: int,
         n_layers: int,
         codebook_size: int,
+        codebook_dim: int | None = None,
         h: int,
         w: int,
         max_t: int,
@@ -48,6 +49,7 @@ class PredictorStage(nn.Module):
         self.w = w
         self.n_spatial = h * w
         self.codebook_size = codebook_size
+        self.codebook_dim = int(codebook_dim if codebook_dim is not None else dim)
         self.max_t = max_t
         self.has_parent = has_parent
         self.parent_mode = parent_mode
@@ -86,7 +88,18 @@ class PredictorStage(nn.Module):
             ])
         self.stream_fusion = build_stream_fusion(stream_fusion_mode, dim)
         self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, codebook_size))
-        self.codebook_embed = nn.Embedding(codebook_size, dim)
+        self.codebook_embed = nn.Embedding(codebook_size, self.codebook_dim)
+        if self.codebook_dim == dim:
+            self.codebook_proj = nn.Identity()
+        else:
+            self.codebook_proj = nn.Linear(self.codebook_dim, dim)
+
+    def _project_codebook_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
+        return self.codebook_proj(vectors)
+
+    def embed_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Flat or (B, N) token ids -> (..., dim) in predictor space."""
+        return self._project_codebook_vectors(self.codebook_embed(token_ids))
 
     def pos_encoding(self, t_len: int) -> torch.Tensor:
         spatial = self.spatial_pos[:, : self.n_spatial]
@@ -158,4 +171,4 @@ class PredictorStage(nn.Module):
         """indices (B,T,H,W) -> (B, T*H*W, dim)"""
         b, t, h, w = indices.shape
         flat = indices.reshape(b, t * h * w)
-        return self.codebook_embed(flat)
+        return self.embed_token_ids(flat)

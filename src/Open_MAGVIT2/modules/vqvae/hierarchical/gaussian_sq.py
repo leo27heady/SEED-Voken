@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
 
+from src.Open_MAGVIT2.modules.numerical_debug import check_tensor, numerical_debug_enabled
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import LayerQuantizer, QuantizerResult
 
 
@@ -25,13 +26,15 @@ def calc_distance(z_continuous, codebook):
         raise ValueError(
             f"z feature dim {feat_dim} != codebook dim {codebook.shape[1]}"
         )
-    z_flat = z_continuous.reshape(-1, feat_dim)
+    # fp32 matmul avoids fp16 overflow on large codebooks (K x D dot products).
+    z_flat = z_continuous.reshape(-1, feat_dim).float()
+    cb = codebook.float()
     distances = (
         torch.sum(z_flat ** 2, dim=1, keepdim=True)
-        + torch.sum(codebook ** 2, dim=1)
-        - 2 * torch.matmul(z_flat, codebook.t())
+        + torch.sum(cb ** 2, dim=1)
+        - 2 * torch.matmul(z_flat, cb.t())
     )
-    return distances
+    return distances.to(dtype=z_continuous.dtype)
 
 
 class GaussianSQQuantizer(LayerQuantizer):
@@ -135,7 +138,12 @@ class GaussianSQQuantizer(LayerQuantizer):
         if var_q_pos is None:
             raise ValueError("GaussianSQQuantizer requires var_q_pos")
         bs, _, t_len, h, w = z.shape
+        dbg = numerical_debug_enabled()
+        if dbg:
+            check_tensor("sq/z_in", z, extra={"K": self.size_dict, "D": self.dim_dict})
         z_cb = self._to_codebook_space(z)
+        if dbg:
+            check_tensor("sq/z_cb", z_cb)
         z_pos = z_cb.permute(0, 2, 3, 4, 1).contiguous()
 
         if torch.numel(var_q_pos) > 1:
@@ -144,10 +152,18 @@ class GaussianSQQuantizer(LayerQuantizer):
             var_main = var_q_pos
         precision = 1.0 / torch.clamp(var_main, min=1e-10)
         distances = calc_distance(z_pos, self.codebook)
+        if dbg:
+            check_tensor(
+                "sq/distances",
+                distances,
+                extra={"max_dist": float(distances.max().item())},
+            )
         logit_pos = (-0.5 * precision * distances).reshape(
             bs, t_len, h, w, self.size_dict
         )
-        prob_pos = F.softmax(logit_pos, dim=-1)
+        if dbg:
+            check_tensor("sq/logit_pos", logit_pos)
+        prob_pos = F.softmax(logit_pos.float(), dim=-1).to(dtype=z.dtype)
         log_prob_pos = F.log_softmax(logit_pos, dim=-1)
         log_prob_pri = self._log_prob_prior(prob_pos, logit_pos, z_pri, var_q_pri)
 
@@ -179,6 +195,8 @@ class GaussianSQQuantizer(LayerQuantizer):
 
         z_cb_out = z_q.permute(0, 4, 1, 2, 3).contiguous()
         z_to_decoder = self._from_codebook_space(z_cb_out)
+        if dbg:
+            check_tensor("sq/z_q", z_to_decoder)
         avg_probs_k = prob_pos.mean(dim=(0, 1, 2, 3))
         perplexity = torch.exp(
             -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
@@ -197,6 +215,8 @@ class GaussianSQQuantizer(LayerQuantizer):
             aux_loss = kld_discrete + kld_continuous
         else:
             aux_loss = kld_discrete
+        if dbg:
+            check_tensor("sq/aux_loss", aux_loss.unsqueeze(0))
 
         if self.usage_reg_weight > 0.0 and self.usage_reg_target_perplexity > 0.0:
             usage_reg = self.usage_reg_weight * (

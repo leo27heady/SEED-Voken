@@ -55,9 +55,12 @@ src/Open_MAGVIT2/
   models/video_hier_predictor.py            # Lightning predictor
 
 configs/Open-MAGVIT2/gpu/
-  shapes3d_sqvae2_64_S_v2.yaml              # production VAE v2
+  shapes3d_sqvae2_64_S_v2.yaml              # production VAE v2 (3-stage, T=13)
   shapes3d_sqvae2_64_S_v2_smoke.yaml        # 2-epoch CPU smoke
   shapes3d_sqvae2_64_S_v2_predict.yaml      # predictor (set vae_ckpt after VAE train)
+  shapes3d_sqvae2_64_S_v4.yaml              # 4-stage VAE @ T=17 (fresh train)
+  shapes3d_sqvae2_64_S_v4_smoke.yaml
+  shapes3d_sqvae2_64_S_v4_predict.yaml      # per-stage predictor dims
 
 scripts/
   validate_v2_vae_gate.py                   # pre-predictor validation gates
@@ -227,6 +230,78 @@ Checkpoints: `checkpoints/predictor/shapes3d_sqvae2_64_S_v2_predict/`
 
 ---
 
+## V4 branch — 4 stages @ T=17 (per-stage predictor)
+
+**Incompatible with v2 checkpoints.** Requires a new VAE train with 5-level encoder (`ch_mult: [1, 2, 2, 2, 2]`).
+
+### Stage geometry @ T=17
+
+| Stage | Spatial key | Native T | H×W | Shifts |
+|-------|-------------|----------|-----|--------|
+| S1 coarse | `h4_w4` | 3 | 4×4 | 1 |
+| S2 | `h8_w8` | 5 | 8×8 | 2 |
+| S3 | `h16_w16` | 9 | 16×16 | 4 |
+| S4 fine | `h32_w32` | 17 | 32×32 | 8 |
+
+- **T_context = 9**, **T_total = 17** (8-frame RGB horizon)
+- Envelope: **15 events** (DFS over shifts 1+2+4+8)
+
+### `ch_mult` (encoder channel multipliers)
+
+`ch_mult` in `ddconfig` is a **list of channel multipliers per encoder level**:
+
+- `len(ch_mult)` = number of pyramid levels = spatial halvings + 1
+- Level `i` width = `ch * ch_mult[i]`
+- Downsample after level `i` (except last):
+  - `ch_mult[i] == 1` → stride `(1, 2, 2)` spatial-only (T preserved)
+  - `ch_mult[i] != 1` → stride `(2, 2, 2)` temporal + spatial
+
+| `ch_mult` @ 64px | Finest tap | Native T @ T=17 |
+|------------------|------------|-----------------|
+| `[1, 2, 2, 4]` (v2) | h8 | 5, 9, 17 |
+| `[1, 2, 2, 2, 2]` (v4) | **h4** | **3, 5, 9, 17** |
+
+Always run `audit_encoder_taps(ddconfig, sequence_length)` before editing `blocks_sq`.
+
+### V4 training sequence
+
+```powershell
+# Validate v4 geometry (no ckpt)
+python scripts/validate_v2_vae_gate.py --profile v4
+
+# Or from yaml
+python scripts/validate_v2_vae_gate.py --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4.yaml
+
+# VAE smoke → full
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4_smoke.yaml
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4.yaml
+
+# Predictor (set vae_ckpt after VAE train)
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4_predict.yaml
+```
+
+### Per-stage predictor config (v4)
+
+`quantizer.dim_dict` is the VAE codebook embedding size per stage. For **v4** use **`[128, 128, 128, 128]`** (matches 128-D h16/h32 taps). v2 uses **`[32, 32, 32]`** with smaller codebooks — do not copy that to v4. Predictor `dim` can be larger per stage; learned **`codebook_proj`** maps frozen VAE codebook vectors into predictor space.
+
+```yaml
+predictor:
+  dim: [384, 256, 192, 128]
+  n_layers: [8, 6, 4, 2]
+  n_heads: [8, 8, 8, 4]
+  temporal_windows: [-1, 3, 3, 1]
+  attention:
+    per_stage:
+      - {type: full}
+      - {type: full}
+      - {type: factorized, t_window: 3, spatial_window: 8}
+      - {type: factorized, t_window: 1, spatial_window: 8}
+```
+
+Legacy 3-stage configs still use `attention.coarse` / `mid` / `fine`. Scalar `dim` / `n_layers` broadcast to all stages.
+
+---
+
 ## Step 6 — Inference modes
 
 | Mode | API | Behavior |
@@ -256,7 +331,7 @@ quantizer:
   dim_dict: [32, 32, 32]
 ```
 
-### Predictor (`shapes3d_sqvae2_64_S_v2_predict.yaml`)
+### Predictor v2 (`shapes3d_sqvae2_64_S_v2_predict.yaml`)
 
 ```yaml
 predictor:
@@ -268,13 +343,22 @@ predictor:
     coarse: {type: full}
     mid:    {type: factorized, t_window: 3}
     fine:   {type: factorized, t_window: 1, spatial_window: 8}
-loss:
-  lambda_ce: 1.0
-  lambda_pred_mse: 0.5
-inference:
-  mode: autoregressive
-  commit: argmax
 ```
+
+### VAE v4 (`shapes3d_sqvae2_64_S_v4.yaml`)
+
+```yaml
+ddconfig:
+  ch_mult: [1, 2, 2, 2, 2]
+hierarchy:
+  sequence_length: 17
+  blocks_sq: "h4_w4_x1,h8_w8_x1,h16_w16_x1,h32_w32_x1"
+quantizer:
+  size_dict: [4096, 2048, 1024, 512]
+  dim_dict: [128, 128, 128, 128]
+```
+
+See **V4 branch** section above for full predictor yaml.
 
 ---
 
@@ -318,11 +402,17 @@ python -m pytest tests/ -q
 
 # Validate gates
 python scripts/validate_v2_vae_gate.py
+python scripts/validate_v2_vae_gate.py --profile v4
 
-# VAE smoke → full
+# VAE v2 smoke → full
 python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2_smoke.yaml
 python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2.yaml
 
+# VAE v4 smoke → full
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4_smoke.yaml
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4.yaml
+
 # Predictor (after setting vae_ckpt)
 python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2_predict.yaml
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4_predict.yaml
 ```

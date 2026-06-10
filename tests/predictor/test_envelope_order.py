@@ -31,3 +31,12 @@ def test_env_03_parent_ancestry():
 def test_env_05_finest_shift_count():
     sched = PyramidSchedule.from_v2_64s()
     assert sched.shifts_per_stage(2) == 4
+
+
+def test_env_04_v4_envelope_and_ancestry():
+    sched = PyramidSchedule.from_v4_64s()
+    assert len(sched.envelope_order()) == 15
+    assert sched.parent_for(1, 0) == (0, 0)
+    assert sched.parent_for(2, 2) == (1, 1)
+    assert sched.parent_for(3, 7) == (2, 3)
+    assert sched.shifts_per_stage(3) == 8

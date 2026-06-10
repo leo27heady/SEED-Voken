@@ -11,6 +11,7 @@ import yaml
 
 from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
 from src.Open_MAGVIT2.modules.predictor.batch_prep import BatchPrep
+from src.Open_MAGVIT2.modules.predictor.config import resolve_stage_attention, stage_list
 from src.Open_MAGVIT2.modules.predictor.orchestrator import EnvelopeOrchestrator
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule
 from src.Open_MAGVIT2.modules.predictor.stage import PredictorStage
@@ -81,34 +82,48 @@ class VideoHierPredictorModel(L.LightningModule):
         )
         self.schedule = stages_cfg
 
-        n_layers = int(predictor.get("n_layers", 4))
-        n_heads = int(predictor.get("n_heads", 8))
-        dim = int(predictor.get("dim", 32))
-        temporal_windows = predictor.get("temporal_windows", [-1, 3, 1])
+        S = self.schedule.S
+        stage_dims = [int(d) for d in stage_list(predictor.get("dim", 32), S, "dim")]
+        stage_layers = [int(n) for n in stage_list(predictor.get("n_layers", 4), S, "n_layers")]
+        stage_heads = [int(n) for n in stage_list(predictor.get("n_heads", 8), S, "n_heads")]
+        default_windows = [-1, 3, 1] if S == 3 else [-1] * S
+        temporal_windows = [
+            int(w) for w in stage_list(
+                predictor.get("temporal_windows", default_windows), S, "temporal_windows"
+            )
+        ]
         attention_cfg = predictor.get("attention", {})
         max_shifts = self.schedule.ratio ** (self.schedule.S - 1)
+
+        for s in range(S):
+            if stage_dims[s] % stage_heads[s] != 0:
+                raise ValueError(
+                    f"predictor.dim[{s}]={stage_dims[s]} must be divisible by "
+                    f"predictor.n_heads[{s}]={stage_heads[s]}"
+                )
 
         pred_stages = nn.ModuleList()
         for s, spec in enumerate(self.schedule.stages):
             has_parent = s > 0
-            stage_attn = attention_cfg.get(
-                ["coarse", "mid", "fine"][min(s, 2)], {"type": "full"}
-            )
+            stage_attn = resolve_stage_attention(attention_cfg, s, temporal_windows)
             attn_type = stage_attn.get("type", "full")
             t_window = stage_attn.get("t_window", temporal_windows[s])
             spatial_window = stage_attn.get("spatial_window")
+            parent_dim = stage_dims[s - 1] if has_parent else None
+            vae_codebook_dim = int(dims[s])
             pred_stages.append(
                 PredictorStage(
-                    dim=dim,
-                    n_heads=n_heads,
-                    n_layers=n_layers,
+                    dim=stage_dims[s],
+                    n_heads=stage_heads[s],
+                    n_layers=stage_layers[s],
                     codebook_size=spec.codebook_size,
+                    codebook_dim=vae_codebook_dim,
                     h=spec.H,
                     w=spec.W,
                     max_t=t_total,
                     max_shifts=max_shifts,
                     has_parent=has_parent,
-                    parent_dim=dim,
+                    parent_dim=parent_dim,
                     parent_mode=parent_conditioning,
                     attention_type=attn_type,
                     t_window=t_window,
@@ -131,9 +146,16 @@ class VideoHierPredictorModel(L.LightningModule):
     def _copy_codebooks(self) -> None:
         for s, block in enumerate(self.vae.hier_quant.blocks):
             q = block.quantizer
-            if hasattr(q, "codebook"):
-                self.predictor_stages[s].codebook_embed.weight.data.copy_(q.codebook.data)
-        for stage in self.predictor_stages:
+            if not hasattr(q, "codebook"):
+                continue
+            stage = self.predictor_stages[s]
+            vae_cb = q.codebook.data
+            if vae_cb.shape != stage.codebook_embed.weight.shape:
+                raise ValueError(
+                    f"Stage {s} codebook shape mismatch: VAE {tuple(vae_cb.shape)} vs "
+                    f"predictor embed {tuple(stage.codebook_embed.weight.shape)}"
+                )
+            stage.codebook_embed.weight.data.copy_(vae_cb)
             stage.codebook_embed.weight.requires_grad_(False)
 
     def _decode_horizon_mse(

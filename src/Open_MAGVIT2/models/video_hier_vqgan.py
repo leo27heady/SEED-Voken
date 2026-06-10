@@ -16,6 +16,13 @@ from src.Open_MAGVIT2.modules.scheduler.lr_scheduler import (
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.factory import build_top_down, set_all_sq_temperature
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.base import QuantizerResult
 from src.Open_MAGVIT2.modules.losses.hier_video_loss import HierVideoReconLoss
+from src.Open_MAGVIT2.modules.numerical_debug import (
+    check_tensor,
+    get_numerical_report,
+    numerical_debug_enabled,
+    reset_numerical_report,
+    set_numerical_debug,
+)
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.hier_elbo_loss import compute_hier_elbo_loss
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import validate_hierarchy_taps
 
@@ -90,6 +97,7 @@ class VideoHierVQModel(L.LightningModule):
         progressive_coding: bool = False,
         progressive_noise_weight: float = 0.0,
         loss_cfg: Optional[Dict[str, Any]] = None,
+        numerical_debug: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -113,6 +121,8 @@ class VideoHierVQModel(L.LightningModule):
         self.resume_lr = resume_lr
         self.progressive_coding = progressive_coding
         self.progressive_noise_weight = progressive_noise_weight
+        self.numerical_debug = numerical_debug
+        self._last_numerical_report = None
         self.automatic_optimization = False
 
         loss_cfg = dict(loss_cfg or {})
@@ -217,9 +227,18 @@ class VideoHierVQModel(L.LightningModule):
         set_all_sq_temperature(self.hier_quant, tau)
         return tau
 
+    def on_train_start(self) -> None:
+        set_numerical_debug(self.numerical_debug, fail_fast=True)
+
     def encode(self, x, flg_train=True, flg_quant_det=False):
+        if self.numerical_debug:
+            reset_numerical_report()
         if self.hierarchy_mode == "sqvae2":
             h, activations = self.encoder(x, return_intermediates=True)
+            if self.numerical_debug:
+                check_tensor("encoder/bottleneck", h)
+                for key, act in activations.items():
+                    check_tensor(f"encoder/tap_{key}", act)
             z_q, layer_results = self.hier_quant(
                 activations,
                 encoder_bottleneck=h,
@@ -304,6 +323,9 @@ class VideoHierVQModel(L.LightningModule):
     def forward(self, x, flg_train=True, flg_quant_det=False):
         z_q, layer_results, _, _ = self.encode(x, flg_train, flg_quant_det)
         x_rec = self.decode(z_q)
+        if self.numerical_debug:
+            check_tensor("decoder/x_rec", x_rec)
+            self._last_numerical_report = get_numerical_report()
         return x_rec, layer_results
 
     def decode_progressive(self, x, flg_quant_det=True, flg_train=False):
@@ -418,6 +440,13 @@ class VideoHierVQModel(L.LightningModule):
             self.manual_backward(loss)
             opt.step()
 
+        if self.numerical_debug:
+            report = get_numerical_report()
+            if report is not None:
+                self._last_numerical_report = report
+                if self.global_step % 100 == 0:
+                    log_dict.update(report.as_log_dict())
+
         log_dict["train/temperature"] = torch.tensor(
             max(self.temp_min, self.temp_init * math.exp(-self.temp_decay * self.global_step))
         )
@@ -428,6 +457,7 @@ class VideoHierVQModel(L.LightningModule):
             on_step=True,
             on_epoch=True,
         )
+        return loss
 
     def validation_step(self, batch, batch_idx):
         if self.use_ema:

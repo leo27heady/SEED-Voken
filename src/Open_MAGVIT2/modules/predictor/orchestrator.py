@@ -53,7 +53,7 @@ class EnvelopeOrchestrator(nn.Module):
             fused = torch.nn.functional.softmax(fused, dim=-1) * fused
         elif self.parent_mode == "fused_hard":
             pred = out.logits.argmax(dim=-1)
-            fused = self.stages[stage_idx].codebook_embed(pred)
+            fused = self.stages[stage_idx].embed_token_ids(pred)
         return ParentCondition.from_shift_output(
             out.o1, out.o2, mode=self.parent_mode, fused=fused
         )
@@ -175,7 +175,7 @@ class EnvelopeOrchestrator(nn.Module):
 
             if mode == "autoregressive" and rolling_ctx is not None and s == finest_s:
                 pred_tok = self._commit_tokens(q_logits)
-                embed_frame = self.stages[s].codebook_embed(pred_tok)
+                embed_frame = self.stages[s].embed_token_ids(pred_tok)
                 rolling_ctx[s] = torch.cat([rolling_ctx[s], embed_frame], dim=1)
 
         pred_indices = self._collect_pred_indices(batch, logits_out)
