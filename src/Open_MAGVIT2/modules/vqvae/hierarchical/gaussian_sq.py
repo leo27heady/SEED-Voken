@@ -239,6 +239,9 @@ class GaussianSQQuantizer(LayerQuantizer):
                 "usage_fraction": torch.tensor(
                     usage_fraction, device=z.device, dtype=z.dtype
                 ),
+                "size_dict": torch.tensor(
+                    float(self.size_dict), device=z.device, dtype=z.dtype
+                ),
             },
         )
 

@@ -10,13 +10,11 @@ export MASTER_PORT=$MASTER_PORT
 echo $MASTER_ADDR
 echo $MASTER_PORT
 
-##NPU
-# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/npu/shapes3d_lfqgan_128_L.yaml
+# Path C — hierarchical SQ-VAE-2 @ 64px (production)
+# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2.yaml
 
-###GPU — flat LFQ baseline
-# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_lfqgan_128_L.yaml
+# Path C — 32px lite dev tokenizer
+# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_32_S_lite.yaml
 
-###GPU — hierarchical SQ-VAE-2 (primary; pick L / M / S)
-# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_S.yaml
-# NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_M.yaml
-NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_128_L.yaml
+# Path C — 4-stage v4 @ T=17
+NODE_RANK=$NODE_RANK python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v4.yaml

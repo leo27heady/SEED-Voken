@@ -22,14 +22,21 @@ def test_ds_routing_parent_streams():
     assert torch.allclose(block._cross_kv, parent + 1)
 
 
-def test_ds_03_fused_soft_single_kv():
+def test_ds_03_fused_hard_single_kv():
     block = ReversibleCouplingBlock(dim=8, n_heads=2, has_cross_attn=True, parent_dim=8)
     fused = torch.randn(1, 10, 8)
     for layer_idx in range(4):
         block.set_parent(
-            parent_mode="fused_soft", o1=None, o2=None, fused=fused, layer_idx=layer_idx
+            parent_mode="fused_hard", o1=None, o2=None, fused=fused, layer_idx=layer_idx
         )
         assert block._cross_kv is fused
+
+
+def test_rev_02_gradcheck_coupling():
+    block = ReversibleCouplingBlock(dim=8, n_heads=2, has_cross_attn=False, custom_backward=False)
+    block = block.double()
+    x = torch.randn(1, 4, 16, dtype=torch.double, requires_grad=True)
+    assert torch.autograd.gradcheck(block, x, eps=1e-6, atol=1e-4)
 
 
 def test_ds_04_parent_dim_projection():

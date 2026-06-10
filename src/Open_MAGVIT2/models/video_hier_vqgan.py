@@ -66,6 +66,12 @@ def _layer_codebook_usage_logs(
             if not torch.is_tensor(uf):
                 uf = torch.tensor(float(uf))
             log_dict[f"{prefix}/code_usage_frac_layer_{i + 1}"] = uf.detach().float()
+        ppl = result.perplexity
+        if torch.is_tensor(ppl) and "size_dict" in stats:
+            k = stats["size_dict"]
+            if not torch.is_tensor(k):
+                k = torch.tensor(float(k), device=ppl.device)
+            log_dict[f"{prefix}/perplexity_frac_layer_{i + 1}"] = (ppl / k).detach()
     return log_dict
 
 
@@ -270,32 +276,21 @@ class VideoHierVQModel(L.LightningModule):
 
     def encode_tokens(self, x, flg_train=False, flg_quant_det=True):
         """Per-level discrete tokens plus fused z_q for the MAGVIT decoder."""
-        if self.hierarchy_mode == "sqvae2":
-            h, activations = self.encoder(x, return_intermediates=True)
-            z_q, layer_results = self.hier_quant(
-                activations,
-                encoder_bottleneck=h,
-                flg_train=flg_train,
-                flg_quant_det=flg_quant_det,
-            )
-            return {
-                "levels": self._pack_token_levels(layer_results),
-                "z_q": z_q,
-                "activations": activations,
-                "encoder_bottleneck": h,
-            }
-        if self.hierarchy_mode == "rsqvae":
-            h = self.encoder(x)
-            z_q, layer_results = self.hier_quant(
-                h, flg_train=flg_train, flg_quant_det=flg_quant_det
-            )
-            return {
-                "levels": self._pack_token_levels(layer_results),
-                "z_q": z_q,
-                "activations": None,
-                "encoder_bottleneck": h,
-            }
-        raise NotImplementedError(f"encode_tokens not supported for mode={self.hierarchy_mode}")
+        if self.hierarchy_mode != "sqvae2":
+            raise NotImplementedError(f"encode_tokens requires sqvae2, got {self.hierarchy_mode}")
+        h, activations = self.encoder(x, return_intermediates=True)
+        z_q, layer_results = self.hier_quant(
+            activations,
+            encoder_bottleneck=h,
+            flg_train=flg_train,
+            flg_quant_det=flg_quant_det,
+        )
+        return {
+            "levels": self._pack_token_levels(layer_results),
+            "z_q": z_q,
+            "activations": activations,
+            "encoder_bottleneck": h,
+        }
 
     def decode_from_indices(
         self,
@@ -303,19 +298,16 @@ class VideoHierVQModel(L.LightningModule):
         activations: Optional[Dict[str, torch.Tensor]] = None,
         encoder_bottleneck: Optional[torch.Tensor] = None,
     ):
-        if self.hierarchy_mode == "sqvae2":
-            if activations is None or encoder_bottleneck is None:
-                raise ValueError("sqvae2 decode_from_indices requires activations and encoder_bottleneck")
-            z_q = self.hier_quant.decode_from_indices(
-                level_indices,
-                activations,
-                encoder_bottleneck=encoder_bottleneck,
-            )
-            return self.decode(z_q)
-        if self.hierarchy_mode == "rsqvae":
-            z_q = self.hier_quant.decode_from_indices(level_indices)
-            return self.decode(z_q)
-        raise NotImplementedError(f"decode_from_indices not supported for mode={self.hierarchy_mode}")
+        if self.hierarchy_mode != "sqvae2":
+            raise NotImplementedError(f"decode_from_indices requires sqvae2, got {self.hierarchy_mode}")
+        if activations is None or encoder_bottleneck is None:
+            raise ValueError("sqvae2 decode_from_indices requires activations and encoder_bottleneck")
+        z_q = self.hier_quant.decode_from_indices(
+            level_indices,
+            activations,
+            encoder_bottleneck=encoder_bottleneck,
+        )
+        return self.decode(z_q)
 
     def decode(self, z_q):
         return self.decoder(z_q)

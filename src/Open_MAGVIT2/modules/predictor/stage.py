@@ -42,6 +42,7 @@ class PredictorStage(nn.Module):
         attention_type: str = "full",
         t_window: int = -1,
         spatial_window: int | None = None,
+        use_reversible_backprop: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -54,6 +55,7 @@ class PredictorStage(nn.Module):
         self.has_parent = has_parent
         self.parent_mode = parent_mode
         self.attention_type = attention_type
+        self.use_reversible_backprop = use_reversible_backprop
 
         self.input_proj = nn.Linear(dim, dim)
         self.spatial_pos = nn.Parameter(torch.randn(1, self.n_spatial, dim) * 0.02)
@@ -83,6 +85,7 @@ class PredictorStage(nn.Module):
                     n_heads=n_heads,
                     has_cross_attn=has_parent,
                     parent_dim=parent_dim or dim,
+                    custom_backward=use_reversible_backprop,
                 )
                 for _ in range(n_layers)
             ])
@@ -93,6 +96,13 @@ class PredictorStage(nn.Module):
             self.codebook_proj = nn.Identity()
         else:
             self.codebook_proj = nn.Linear(self.codebook_dim, dim)
+        self._init_stage_weights()
+
+    def _init_stage_weights(self) -> None:
+        head_linear = self.output_head[-1]
+        nn.init.zeros_(head_linear.weight)
+        if head_linear.bias is not None:
+            nn.init.zeros_(head_linear.bias)
 
     def _project_codebook_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
         return self.codebook_proj(vectors)
@@ -146,7 +156,12 @@ class PredictorStage(nn.Module):
                     block.set_parent(
                         parent_mode="none", o1=None, o2=None, fused=None, layer_idx=layer_idx
                     )
-                x = block(x)
+            if self.use_reversible_backprop and self.training:
+                from src.Open_MAGVIT2.modules.predictor.rev_back_prop import EfficientRevBackProp
+                x = EfficientRevBackProp.apply(x, 1, list(self.rev_layers))
+            else:
+                for block in self.rev_layers:
+                    x = block(x)
         else:
             for layer_idx, block in enumerate(self.layers):
                 pmode = parent.mode if parent is not None else "none"

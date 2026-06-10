@@ -46,9 +46,11 @@ def compute_hier_elbo_loss(
         distortion, mse = _arelbo_distortion(x, x_rec, progressive_noise_weight)
 
     kl_total = torch.zeros((), device=x.device, dtype=x.dtype)
+    dim_x = x[0].numel()
     log_dict: Dict[str, torch.Tensor] = {
         "loss/distortion": distortion.detach(),
         "loss/mse": mse.detach(),
+        "loss/mse_per_pixel": (mse / dim_x).detach(),
         **log_dict_prog,
     }
     num_layers = len(layer_results)

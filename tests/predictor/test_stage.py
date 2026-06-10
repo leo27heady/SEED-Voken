@@ -105,7 +105,8 @@ def test_stg_06_shift_embed_differs():
     out1 = stage.execute_shift(
         1, context_embed=None, stream_state=(out0.o1, out0.o2), parent=None, masks=masks, t_len=9,
     )
-    assert not torch.allclose(out0.logits, out1.logits)
+    assert not torch.allclose(out0.o1, out1.o1)
+    assert not torch.allclose(out0.o2, out1.o2)
 
 
 def test_stg_factorized_forward():

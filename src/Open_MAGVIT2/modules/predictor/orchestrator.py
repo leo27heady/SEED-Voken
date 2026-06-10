@@ -23,6 +23,7 @@ class PredictorOutput:
     logits: Dict[Tuple[int, int], torch.Tensor]
     pred_indices: Dict[int, torch.Tensor]
     ar_context_len: Optional[int] = None
+    ce_breakdown: Optional[Dict[Tuple[int, int], torch.Tensor]] = None
 
 
 class EnvelopeOrchestrator(nn.Module):
@@ -48,10 +49,8 @@ class EnvelopeOrchestrator(nn.Module):
         self.mask_builder = PyramidMaskBuilder(schedule)
 
     def _parent_from_output(self, out: ShiftOutput, stage_idx: int) -> ParentCondition:
-        fused = self.stages[stage_idx].stream_fusion(torch.cat([out.o1, out.o2], dim=-1))
-        if self.parent_mode == "fused_soft":
-            fused = torch.nn.functional.softmax(fused, dim=-1) * fused
-        elif self.parent_mode == "fused_hard":
+        fused = None
+        if self.parent_mode == "fused_hard":
             pred = out.logits.argmax(dim=-1)
             fused = self.stages[stage_idx].embed_token_ids(pred)
         return ParentCondition.from_shift_output(
@@ -74,13 +73,20 @@ class EnvelopeOrchestrator(nn.Module):
     def forward_train(self, batch: PreparedBatch) -> PredictorOutput:
         return self._forward_envelope(batch, mode="train")
 
-    def forward_parallel(self, batch: PreparedBatch) -> PredictorOutput:
-        """Oracle eval upper bound: full native-T GT embeds at shift 0."""
-        full_ctx = {
-            s: self.stages[s].embed_indices(batch.gt_indices[s])
-            for s in batch.gt_indices
-        }
-        aug = replace(batch, context_embed=full_ctx)
+    def forward_parallel(
+        self, batch: PreparedBatch, *, parallel_mode: str = "full"
+    ) -> PredictorOutput:
+        """Oracle eval: full native-T GT embeds (full) or context-only embeds (context)."""
+        if parallel_mode == "full":
+            full_ctx = {
+                s: self.stages[s].embed_indices(batch.gt_indices[s])
+                for s in batch.gt_indices
+            }
+            aug = replace(batch, context_embed=full_ctx)
+        elif parallel_mode == "context":
+            aug = batch
+        else:
+            raise ValueError(f"Unknown parallel_mode: {parallel_mode!r}")
         return self._forward_envelope(aug, mode="parallel")
 
     def forward_autoregressive(self, batch: PreparedBatch) -> PredictorOutput:
@@ -100,6 +106,7 @@ class EnvelopeOrchestrator(nn.Module):
         parent_by_stage: Dict[int, ParentCondition] = {}
         stream_carry: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         logits_out: Dict[Tuple[int, int], torch.Tensor] = {}
+        ce_breakdown: Dict[Tuple[int, int], torch.Tensor] = {}
         loss_ce = None
         finest_s = self.schedule.S - 1
 
@@ -170,6 +177,7 @@ class EnvelopeOrchestrator(nn.Module):
             q_logits = out.logits[:, sup.query_positions]
             tgt = batch.target_indices[s][k]
             ce = F.cross_entropy(q_logits.reshape(-1, q_logits.shape[-1]), tgt.reshape(-1))
+            ce_breakdown[(s, k)] = ce.detach()
             w = self._ce_weight(s, k)
             loss_ce = ce * w if loss_ce is None else loss_ce + ce * w
 
@@ -187,6 +195,7 @@ class EnvelopeOrchestrator(nn.Module):
             logits=logits_out,
             pred_indices=pred_indices,
             ar_context_len=ar_len,
+            ce_breakdown=ce_breakdown,
         )
 
     def _collect_pred_indices(

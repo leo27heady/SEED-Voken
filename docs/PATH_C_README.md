@@ -57,13 +57,16 @@ src/Open_MAGVIT2/
 configs/Open-MAGVIT2/gpu/
   shapes3d_sqvae2_64_S_v2.yaml              # production VAE v2 (3-stage, T=13)
   shapes3d_sqvae2_64_S_v2_smoke.yaml        # 2-epoch CPU smoke
-  shapes3d_sqvae2_64_S_v2_predict.yaml      # predictor (set vae_ckpt after VAE train)
+  shapes3d_sqvae2_64_S_v2_predict.yaml      # predictor (parallel_mode: full)
+  shapes3d_sqvae2_32_S_lite.yaml            # 32px fast VAE dev (same hierarchy)
+  shapes3d_sqvae2_32_S_lite_predict.yaml    # 32px predictor (parallel_mode: context)
   shapes3d_sqvae2_64_S_v4.yaml              # 4-stage VAE @ T=17 (fresh train)
   shapes3d_sqvae2_64_S_v4_smoke.yaml
   shapes3d_sqvae2_64_S_v4_predict.yaml      # per-stage predictor dims
 
 scripts/
   validate_v2_vae_gate.py                   # pre-predictor validation gates
+  resume_vae_training.ps1 / .sh             # resume VAE from checkpoint
 
 tests/
   test_encoder_v2.py                        # EV2-* encoder tests
@@ -96,7 +99,7 @@ Run these in order after pulling the audit-fix branch:
 .\venv\Scripts\Activate.ps1
 $env:PYTHONPATH = (Get-Location).Path
 
-# 1. Unit tests (expect ≥95 passed)
+# 1. Unit tests (expect ≥119 passed)
 python -m pytest tests/ -q
 
 # 2. Encoder v2 validation gates
@@ -124,7 +127,7 @@ python scripts/migrate_jq0ynj5m_to_v2.py --old_ckpt path/to/jq0ynj5m.ckpt --out 
 ```powershell
 $env:PYTHONPATH = "C:\Users\leoni\Documents\projects\SEED-Voken"
 python -m pytest tests/ -q
-# Expected: 109 passed
+# Expected: 119+ passed
 ```
 
 Targeted suites:
@@ -167,13 +170,21 @@ python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2.yam
 
 | Setting | Value |
 |---------|-------|
-| Monitor | `val_ema/mse` (min) |
+| Monitor | `val_ema/mse` (min); also log `loss/mse_per_pixel` |
 | Checkpoints | `checkpoints/vqgan/shapes3d_sqvae2_64_S_v2/` |
 | W&B project | `seed-voken-shapes3d` / run `sqvae2_64_S_v2` |
 | Sequence length | 13 |
 | Tap keys | spatial (`h8_w8`, `h16_w16`, `h32_w32`) |
 
-**Gate before predictor:** `val_ema/mse` comparable to jq0ynj5m @ T=9 trend.
+**MSE scale:** `loss/mse` is a **sum** over `C×T×H×W`; divide by `3×13×64×64 ≈ 159k` for per-pixel (~0.001–0.003 when recon is good). Use `loss/mse_per_pixel` in logs.
+
+**Resume training:**
+
+```powershell
+.\scripts\resume_vae_training.ps1 -CkptPath "path\to\epoch=67.ckpt"
+```
+
+**Gate before predictor:** `val_ema/mse_per_pixel` plateau (or sum-MSE < ~200 @ 64px T=13).
 
 Re-validate with checkpoint:
 
@@ -225,8 +236,11 @@ python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2_pre
 | Optimizer | AdamW, lr=1e-4 |
 | Attention | coarse=full rev · mid/fine=factorized |
 | Inference val | parallel + autoregressive logged |
+| `parallel_mode` | `full` = oracle shift-0 embeds; `context` = train-like (OOM-safe) |
 
 Checkpoints: `checkpoints/predictor/shapes3d_sqvae2_64_S_v2_predict/`
+
+**32px lite dev:** use `shapes3d_sqvae2_32_S_lite_predict.yaml` (`parallel_mode: context` default).
 
 ---
 
@@ -306,8 +320,9 @@ Legacy 3-stage configs still use `attention.coarse` / `mid` / `fine`. Scalar `di
 
 | Mode | API | Behavior |
 |------|-----|----------|
-| Train / parallel | `orchestrator.forward_train` / `forward_parallel` | GT context embeds, `streams_only` |
-| Autoregressive | `orchestrator.forward_autoregressive` | Rolling finest embed buffer grows; no RGB re-encode |
+| Train | `orchestrator.forward_train` | GT context embeds, `streams_only` |
+| Parallel | `forward_parallel(parallel_mode=...)` | `full`: full native-T embeds @ shift 0; `context`: train-like |
+| Autoregressive | `forward_autoregressive` | Finest stage re-inits from rolling embed on k>0; mid/top use stream carry |
 
 From Lightning:
 
@@ -374,19 +389,19 @@ See **V4 branch** section above for full predictor yaml.
 
 ---
 
-## Known limitations (post audit-fix)
+## Known limitations
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Full parallel oracle | Partial | Shift 0 uses full GT embeds; k>0 still uses stream carry |
-| Full AR exposure bias | Partial | Finest stage k>0 re-inits from rolling embed; mid/top use `streams_only` |
+| Parallel oracle | `parallel_mode: full` | Shift 0 uses full native-T embeds; k>0 still stream carry |
+| AR exposure bias | Partial | Finest rolling_ctx on k>0; mid/top `streams_only` by design |
 | Bot CE query frame | By design | All bot shifts query frame 8 (`streams_only` + fixed `query_t`) |
-| Factorized fine stage | By design | Not reversible; uses `spatial_window=8` local spatial attn |
-| Index prefix cross-T | Expected | Activations stable (<1e-5); quantized indices may differ |
-| EfficientRevBackProp | Deferred | Rev inverse unused in backward; higher memory on coarse stage |
-| Production VAE ckpt | **Pending** | Required before predictor training (`vae_ckpt: null`) |
+| Parent modes | `dual_stream` default | `fused_soft` removed; `fused_hard` optional |
+| Zero-init output head | By design | CE starts at `log(K)`; hidden states differ by shift |
+| EfficientRevBackProp | Opt-in | `use_reversible_backprop: true` on coarse PredictorStage |
+| VAE recon | Resume recommended | epoch-67 ckpt wired; train to `mse_per_pixel` plateau |
 
-See **`docs/PATH_C_AUDIT.md`** for the original audit; many items above were fixed in the audit-fix pass.
+See **`docs/PATH_C_AUDIT.md`** for the current audit status.
 
 ---
 

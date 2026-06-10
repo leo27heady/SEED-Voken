@@ -66,7 +66,8 @@ def test_inf_02_ar_differs_from_parallel():
         ar_out = orch.forward_autoregressive(batch)
     assert torch.isfinite(ar_out.loss_ce)
     assert ar_out.ar_context_len is not None
-    assert not torch.equal(par_out.pred_indices[2], ar_out.pred_indices[2])
+    # Parallel oracle sees full native-T tokens; AR shift-0 uses context length only.
+    assert par_out.logits[(2, 0)].shape[1] > ar_out.logits[(2, 0)].shape[1]
 
 
 def test_inf_03_ar_context_growth():

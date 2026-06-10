@@ -8,7 +8,7 @@ from typing import Literal, Optional
 import torch
 
 
-ParentMode = Literal["dual_stream", "fused_soft", "fused_hard", "none"]
+ParentMode = Literal["dual_stream", "fused_hard", "none"]
 
 
 @dataclass

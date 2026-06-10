@@ -1,5 +1,7 @@
 # Hierarchical SQ-VAE-2 roadmap — implementation report
 
+> **Note (2026-06):** Historical roadmap doc (128px ablations, RSQ, GAN, learned priors). Active code is **Path C only** — see [PATH_C_README.md](./PATH_C_README.md). Removed configs are not runnable.
+
 This document describes the Tier A–D extensions added on top of the baseline 2-level SQ-VAE-2 video tokenizer, how to configure them, and how to validate behavior.
 
 ## Plan compliance checklist
