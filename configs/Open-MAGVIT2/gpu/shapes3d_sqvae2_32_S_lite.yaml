@@ -23,7 +23,7 @@ trainer:
     - class_path: src.Open_MAGVIT2.callbacks.video_reconstruction_logger.VideoReconstructionLogger
       init_args:
         every_n_epochs: 1
-        max_samples: 2
+        max_samples: 7
         log_wandb: true
         save_dir: reconstructions
         cell_size: 96
@@ -71,7 +71,7 @@ model:
         decay: 1.0e-5
         min: 0.3
     learning_rate: 1.0e-4
-    numerical_debug: true
+    numerical_debug: false
     training_objective: hq_elbo
     use_gan: false
     use_ema: true

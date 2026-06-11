@@ -20,21 +20,23 @@ def gumbel_softmax_sample(logits, temperature):
 
 
 def calc_distance(z_continuous, codebook):
-    """Pairwise squared L2 distance; z_continuous last dim must match codebook dim."""
+    """Pairwise squared L2 distance; z_continuous last dim must match codebook dim.
+
+    Always returns float32: ||z-c||^2 can exceed fp16 max (~65504) for large D or
+    hierarchical residuals under AMP, even when the true distance is finite.
+    """
     feat_dim = z_continuous.shape[-1]
     if feat_dim != codebook.shape[1]:
         raise ValueError(
             f"z feature dim {feat_dim} != codebook dim {codebook.shape[1]}"
         )
-    # fp32 matmul avoids fp16 overflow on large codebooks (K x D dot products).
     z_flat = z_continuous.reshape(-1, feat_dim).float()
     cb = codebook.float()
-    distances = (
+    return (
         torch.sum(z_flat ** 2, dim=1, keepdim=True)
         + torch.sum(cb ** 2, dim=1)
         - 2 * torch.matmul(z_flat, cb.t())
     )
-    return distances.to(dtype=z_continuous.dtype)
 
 
 class GaussianSQQuantizer(LayerQuantizer):
@@ -119,7 +121,7 @@ class GaussianSQQuantizer(LayerQuantizer):
                     f"({self.dim_dict}), got {z_pri_perm.shape[-1]}"
                 )
             distances_pri = calc_distance(z_pri_perm, self.codebook)
-            logit_pri = (-0.5 * precision_pri * distances_pri).reshape(
+            logit_pri = (-0.5 * precision_pri.float() * distances_pri).reshape(
                 bs, t_len, h, w, self.size_dict
             )
             return F.log_softmax(logit_pri, dim=-1)
@@ -158,7 +160,7 @@ class GaussianSQQuantizer(LayerQuantizer):
                 distances,
                 extra={"max_dist": float(distances.max().item())},
             )
-        logit_pos = (-0.5 * precision * distances).reshape(
+        logit_pos = (-0.5 * precision.float() * distances).reshape(
             bs, t_len, h, w, self.size_dict
         )
         if dbg:

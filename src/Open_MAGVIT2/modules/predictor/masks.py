@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 import torch
+import torch.nn as nn
 
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule, ShiftMasks
 
@@ -112,4 +113,35 @@ class PyramidMaskBuilder:
                         s, ps, child_shift=k, parent_shift=pk, device=device
                     )
                 out[(s, k)] = ShiftMasks(self_attn=self_m, cross_attn=cross_m)
+        return out
+
+
+class PredictorMaskCache(nn.Module):
+    """Pre-baked envelope masks; moved with the model, no per-step rebuild."""
+
+    def __init__(
+        self,
+        schedule: PyramidSchedule,
+        temporal_windows: Sequence[int],
+    ) -> None:
+        super().__init__()
+        self._keys: list[tuple[int, int]] = []
+        self._has_cross: dict[tuple[int, int], bool] = {}
+        builder = PyramidMaskBuilder(schedule)
+        all_masks = builder.build_all_masks(temporal_windows, torch.device("cpu"))
+        for (s, k), masks in sorted(all_masks.items()):
+            self._keys.append((s, k))
+            self.register_buffer(f"self_{s}_{k}", masks.self_attn)
+            if masks.cross_attn is not None:
+                self.register_buffer(f"cross_{s}_{k}", masks.cross_attn)
+                self._has_cross[(s, k)] = True
+
+    def get_all(self, device: torch.device) -> dict[tuple[int, int], ShiftMasks]:
+        out: dict[tuple[int, int], ShiftMasks] = {}
+        for s, k in self._keys:
+            self_m = getattr(self, f"self_{s}_{k}").to(device)
+            cross_m = None
+            if self._has_cross.get((s, k), False):
+                cross_m = getattr(self, f"cross_{s}_{k}").to(device)
+            out[(s, k)] = ShiftMasks(self_attn=self_m, cross_attn=cross_m)
         return out

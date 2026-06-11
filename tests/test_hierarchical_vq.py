@@ -8,7 +8,10 @@ import torch
 from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel, _layer_codebook_usage_logs
 from src.Open_MAGVIT2.modules.diffusionmodules.improved_video_model import Decoder, Encoder
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.factory import build_top_down
-from src.Open_MAGVIT2.modules.vqvae.hierarchical.gaussian_sq import GaussianSQQuantizer
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.gaussian_sq import (
+    GaussianSQQuantizer,
+    calc_distance,
+)
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.hier_elbo_loss import compute_hier_elbo_loss
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import audit_encoder_taps
 from src.Open_MAGVIT2.utils.video_viz import make_comparison_grid, videos_to_row_dict
@@ -52,6 +55,24 @@ def test_gaussian_sq_forward_backward():
     out.aux_loss.backward()
     assert z.grad is not None
     assert out.z_q.shape == z.shape
+
+
+def test_calc_distance_stays_finite_fp32_under_large_residual():
+    """Crash-scale hierarchical residual (D=96, |z|~75) must not overflow to inf."""
+    d, k = 96, 2048
+    z = torch.full((1, 1, 1, 1, d), 74.94, dtype=torch.float16)
+    cb = torch.randn(k, d)
+    distances = calc_distance(z, cb)
+    assert distances.dtype == torch.float32
+    assert torch.isfinite(distances).all()
+    assert distances.max().item() > 65504.0
+
+    q = GaussianSQQuantizer(size_dict=k, dim_dict=d, in_channels=16)
+    z5d = torch.full((2, 16, 5, 8, 8), 75.0, dtype=torch.float16)
+    with torch.autocast(device_type="cpu", dtype=torch.float16):
+        out = q(z5d, var_q_pos=torch.tensor([60.0]), flg_train=True, flg_quant_det=True)
+    assert torch.isfinite(out.aux_loss).item()
+    assert torch.isfinite(out.perplexity).item()
 
 
 def test_gaussian_sq_large_codebook_with_in_channels_proj():

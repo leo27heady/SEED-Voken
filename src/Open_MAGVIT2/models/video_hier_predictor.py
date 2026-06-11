@@ -12,6 +12,7 @@ import yaml
 
 from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
 from src.Open_MAGVIT2.modules.predictor.batch_prep import BatchPrep
+from src.Open_MAGVIT2.modules.predictor.masks import PredictorMaskCache
 from src.Open_MAGVIT2.modules.predictor.config import resolve_stage_attention, stage_list
 from src.Open_MAGVIT2.modules.predictor.orchestrator import EnvelopeOrchestrator
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule
@@ -164,7 +165,10 @@ class VideoHierPredictorModel(L.LightningModule):
             temporal_windows=temporal_windows,
             commit_mode=self.commit_mode,
         )
-        self.batch_prep = BatchPrep(self.schedule, temporal_windows)
+        self.mask_cache = PredictorMaskCache(self.schedule, temporal_windows)
+        self.batch_prep = BatchPrep(
+            self.schedule, temporal_windows, mask_cache=self.mask_cache
+        )
         self._copy_codebooks()
 
     def _copy_codebooks(self) -> None:
@@ -247,7 +251,7 @@ class VideoHierPredictorModel(L.LightningModule):
             self.log("train/pred_mse", out.loss_mse)
         self._log_ce_breakdown(out, "train")
         
-        if self.trainer is not None and self.trainer.optimizers():
+        if self.trainer is not None and self.trainer.optimizers:
             self._lr_annealing()
         return loss
 

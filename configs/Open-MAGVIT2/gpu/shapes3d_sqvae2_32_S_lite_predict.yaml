@@ -15,7 +15,7 @@ model:
   class_path: src.Open_MAGVIT2.models.video_hier_predictor.VideoHierPredictorModel
   init_args:
     vae_config: configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_32_S_lite.yaml
-    vae_ckpt: null
+    vae_ckpt: "C:\\Users\\leoni\\Documents\\checkpoints\\vqgan\\shapes3d_sqvae2_32_S_lite\\epoch=67-step=70856.ckpt"
     freeze_encoder: true
     t_context: 5
     t_total: 9
@@ -23,14 +23,14 @@ model:
     shift_reentry:
       mode: streams_only
     predictor:
-      dim: [256, 192, 128]
-      n_layers: [8, 6, 4]
+      dim: [256, 64, 16]
+      n_layers: [6, 4, 2]
       n_heads: [8, 8, 4]
       temporal_windows: [-1, 3, 1]
       attention:
         coarse: {type: full}
         mid: {type: factorized, t_window: 3}
-        fine: {type: factorized, t_window: 1, spatial_window: 8}
+        fine: {type: factorized, t_window: 1, spatial_window: 4}
     loss:
       lambda_ce: 1.0
       lambda_pred_mse: 0.5
@@ -44,8 +44,8 @@ model:
 data:
   class_path: main.DataModuleFromConfig
   init_args:
-    batch_size: 8
-    num_workers: 4
+    batch_size: 32
+    num_workers: 8
     train:
       target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
       params:
@@ -53,7 +53,7 @@ data:
           size: 32
           mode: train
           sequence_length: 9
-          dataset_size: 10000
+          dataset_size: 50000
           cache: true
           shape_scene_type: DIM_3
           shape_min_cubes: 2
@@ -69,7 +69,7 @@ data:
           size: 32
           mode: validation
           sequence_length: 9
-          dataset_size: 500
+          dataset_size: 1000
           cache: true
           shape_scene_type: DIM_3
           shape_min_cubes: 2

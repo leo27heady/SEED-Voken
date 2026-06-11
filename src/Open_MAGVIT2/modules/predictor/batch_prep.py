@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from src.Open_MAGVIT2.modules.predictor.masks import PyramidMaskBuilder
+from src.Open_MAGVIT2.modules.predictor.masks import PredictorMaskCache, PyramidMaskBuilder
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule, ShiftMasks, ShiftSupervision
 
 
@@ -17,7 +17,7 @@ class PreparedBatch:
     context_embed: Dict[int, torch.Tensor]
     supervision: Dict[int, Dict[int, ShiftSupervision]]
     target_indices: Dict[int, Dict[int, torch.Tensor]]
-    masks: Dict[int, Dict[int, ShiftMasks]]
+    masks: Dict[tuple[int, int], ShiftMasks]
     native_t: Dict[int, int]
     stream_carry: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     activations: Optional[dict] = None
@@ -30,10 +30,12 @@ class BatchPrep:
         self,
         schedule: PyramidSchedule,
         temporal_windows: List[int],
+        mask_cache: PredictorMaskCache | None = None,
     ) -> None:
         self.schedule = schedule
         self.temporal_windows = temporal_windows
         self.mask_builder = PyramidMaskBuilder(schedule)
+        self.mask_cache = mask_cache
 
     @torch.no_grad()
     def build_full_context_embed(
@@ -73,7 +75,10 @@ class BatchPrep:
                 target_indices[s][k] = flat_tgt
                 supervision[s][k] = sup
 
-        masks = self.mask_builder.build_all_masks(self.temporal_windows, device)
+        if self.mask_cache is not None:
+            masks = self.mask_cache.get_all(device)
+        else:
+            masks = self.mask_builder.build_all_masks(self.temporal_windows, device)
         return PreparedBatch(
             gt_indices=gt_indices,
             context_embed=context_embed,

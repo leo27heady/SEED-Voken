@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch.nn import MultiheadAttention as MHA
 
+from src.Open_MAGVIT2.modules.predictor.attention.utils import mha_self_attention
+
 
 class ParallelPredictorResidual(nn.Module):
     def __init__(
@@ -59,7 +61,7 @@ class ParallelPredictorResidual(nn.Module):
     ) -> torch.Tensor:
         y = self.norm(x)
         sa_mask = ~self_attn_mask if self_attn_mask is not None else None
-        sa_out, _ = self.self_attn(y, y, y, attn_mask=sa_mask)
+        sa_out = mha_self_attention(self.self_attn, y, attn_mask=sa_mask)
         delta = sa_out
         if self.has_cross_attn and cross_kv is not None:
             q = self.cross_attn_q(y)
