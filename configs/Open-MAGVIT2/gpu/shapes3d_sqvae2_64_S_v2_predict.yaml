@@ -9,6 +9,32 @@ trainer:
   check_val_every_n_epoch: 2
   log_every_n_steps: 50
   default_root_dir: ../../checkpoints/predictor/shapes3d_sqvae2_64_S_v2_predict
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/predictor/sqvae2_64_S_v2_predict"
+        monitor: val/loss_total_ar
+        mode: min
+        save_top_k: 3
+        save_last: true
+        filename: "epoch={epoch:03d}-step={step}-val_total={val/loss_total_ar:.4f}"
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: src.Open_MAGVIT2.callbacks.predictor_horizon_logger.PredictorHorizonLogger
+      init_args:
+        every_n_epochs: 1
+        max_samples: 4
+        log_wandb: true
+        save_dir: predictions
+        cell_size: 96
+    - class_path: src.Open_MAGVIT2.callbacks.nan_guard.NanGuardCallback
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: seed-voken-shapes3d
+      name: sqvae2_64_S_v2_predict
+      save_dir: ../../results/predictor/
 
 model:
   class_path: src.Open_MAGVIT2.models.video_hier_predictor.VideoHierPredictorModel

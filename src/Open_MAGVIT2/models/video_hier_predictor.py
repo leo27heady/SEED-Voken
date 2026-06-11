@@ -14,6 +14,11 @@ from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
 from src.Open_MAGVIT2.modules.predictor.batch_prep import BatchPrep
 from src.Open_MAGVIT2.modules.predictor.masks import PredictorMaskCache
 from src.Open_MAGVIT2.modules.predictor.config import resolve_stage_attention, stage_list
+from src.Open_MAGVIT2.modules.predictor.metrics import (
+    build_train_log_dict,
+    build_val_log_dict,
+    total_loss,
+)
 from src.Open_MAGVIT2.modules.predictor.orchestrator import EnvelopeOrchestrator
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule
 from src.Open_MAGVIT2.modules.predictor.stage import PredictorStage
@@ -186,106 +191,134 @@ class VideoHierPredictorModel(L.LightningModule):
             stage.codebook_embed.weight.data.copy_(vae_cb)
             stage.codebook_embed.weight.requires_grad_(False)
 
-    def _decode_horizon_mse(
+    def _decode_activations(self, batch):
+        if self.pred_mse_activations == "gt":
+            return batch.activations, batch.encoder_bottleneck
+        acts = {k: torch.zeros_like(v) for k, v in batch.activations.items()}
+        return acts, torch.zeros_like(batch.encoder_bottleneck)
+
+    def _decode_video_from_indices(
         self,
         batch,
         pred_indices: Dict[int, torch.Tensor],
     ) -> torch.Tensor:
         level_indices = [pred_indices[s] for s in range(self.schedule.S)]
-        if self.pred_mse_activations == "gt":
-            acts = batch.activations
-            bottleneck = batch.encoder_bottleneck
-        else:
-            acts = {k: torch.zeros_like(v) for k, v in batch.activations.items()}
-            bottleneck = torch.zeros_like(batch.encoder_bottleneck)
-
-        recon = self.vae.decode_from_indices(
+        acts, bottleneck = self._decode_activations(batch)
+        return self.vae.decode_from_indices(
             level_indices,
             acts,
             encoder_bottleneck=bottleneck,
-        )
+        ).clamp(-1, 1)
 
+    def _decode_horizon_mse(
+        self,
+        batch,
+        pred_indices: Dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        recon = self._decode_video_from_indices(batch, pred_indices)
         target = batch.video
         horizon = recon[:, :, self.t_context : self.t_total]
         gt = target[:, :, self.t_context : self.t_total]
-
         return torch.mean((horizon - gt) ** 2)
 
 
 
     def forward_batch(self, video: torch.Tensor, *, inference_mode: Optional[str] = None):
-        batch = self.batch_prep.encode_and_schedule(self.vae, video, self.predictor_stages)
-        mode = inference_mode or "train"
+        # Predictor + large-vocab CE are unstable in fp16 (batch 32, K up to 4096).
+        device_type = "cuda" if video.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            batch = self.batch_prep.encode_and_schedule(self.vae, video, self.predictor_stages)
+            mode = inference_mode or "train"
 
-        if mode == "parallel":
-            out = self.orchestrator.forward_parallel(batch, parallel_mode=self.parallel_mode)
-        elif mode == "autoregressive":
-            out = self.orchestrator.forward_autoregressive(batch)
-        else:
-            out = self.orchestrator.forward_train(batch)
+            if mode == "parallel":
+                out = self.orchestrator.forward_parallel(batch, parallel_mode=self.parallel_mode)
+            elif mode == "autoregressive":
+                out = self.orchestrator.forward_autoregressive(batch)
+            else:
+                out = self.orchestrator.forward_train(batch)
 
-        if self.lambda_pred_mse > 0:
-            out.loss_mse = self._decode_horizon_mse(batch, out.pred_indices)
+            if self.lambda_pred_mse > 0:
+                out.loss_mse = self._decode_horizon_mse(batch, out.pred_indices)
 
-        total = self.lambda_ce * out.loss_ce
+            total = self.lambda_ce * out.loss_ce
 
-        if out.loss_mse is not None:
-            total = total + self.lambda_pred_mse * out.loss_mse
+            if out.loss_mse is not None:
+                total = total + self.lambda_pred_mse * out.loss_mse
 
-        return total, out
+        return total, out, batch
 
-    def _log_ce_breakdown(self, out, prefix: str) -> None:
-        if out.ce_breakdown is None:
-            return
+    @torch.no_grad()
+    def log_images(self, batch, **kwargs):
+        """Decode paths for horizon visualization (callback contract)."""
+        video = batch["video"].to(self.device)
+        prep = self.batch_prep.encode_and_schedule(self.vae, video, self.predictor_stages)
 
-        for (s, k), ce in out.ce_breakdown.items():
-            self.log(f"{prefix}/ce_s{s}_k{k}", ce)
+        gt_indices = {s: prep.gt_indices[s] for s in range(self.schedule.S)}
+        vae_recon = self._decode_video_from_indices(prep, gt_indices)
+
+        out_train = self.orchestrator.forward_train(prep)
+        pred_train = self._decode_video_from_indices(prep, out_train.pred_indices)
+
+        out_parallel = self.orchestrator.forward_parallel(
+            prep, parallel_mode=self.parallel_mode
+        )
+        pred_parallel = self._decode_video_from_indices(prep, out_parallel.pred_indices)
+
+        out_ar = self.orchestrator.forward_autoregressive(prep)
+        pred_ar = self._decode_video_from_indices(prep, out_ar.pred_indices)
+
+        return {
+            "inputs": video,
+            "vae_recon": vae_recon,
+            "pred_train": pred_train,
+            "pred_parallel": pred_parallel,
+            "pred_ar": pred_ar,
+        }
 
     def training_step(self, batch, batch_idx):
         video = batch["video"]
-        loss, out = self.forward_batch(video, inference_mode="train")
-        self.log("train/loss", loss)
-        self.log("train/ce", out.loss_ce)
-
-        if out.loss_mse is not None:
-            self.log("train/pred_mse", out.loss_mse)
-        self._log_ce_breakdown(out, "train")
-        
         if self.trainer is not None and self.trainer.optimizers:
             self._lr_annealing()
+
+        loss, out, prep = self.forward_batch(video, inference_mode="train")
+        log_dict = build_train_log_dict(self, out, prep, loss_total=loss)
+        self.log_dict(log_dict, logger=True, on_step=True, on_epoch=True)
+        self.log("train/loss_total", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         video = batch["video"]
         out_par = None
-        
+        parallel_skipped = False
+
         try:
-            _, out_par = self.forward_batch(video, inference_mode="parallel")
+            _, out_par, _ = self.forward_batch(video, inference_mode="parallel")
         except RuntimeError as exc:
             msg = str(exc).lower()
             if "out of memory" in msg or "not enough memory" in msg:
-                self.log("val/parallel_skipped", 1.0)
+                parallel_skipped = True
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             else:
                 raise
 
-        loss_ar, out_ar = self.forward_batch(video, inference_mode="autoregressive")
-        self.log("val/loss_ar", out_ar.loss_ce, prog_bar=True)
-        self.log("val/ce_ar", out_ar.loss_ce)
-
-        if out_ar.loss_mse is not None:
-            self.log("val/pred_mse_ar", out_ar.loss_mse)
-        self._log_ce_breakdown(out_ar, "val_ar")
-
-        if out_par is not None:
-            self.log("val/loss_parallel", out_par.loss_ce)
-            self.log("val/ce_parallel", out_par.loss_ce)
-            if out_par.loss_mse is not None:
-                self.log("val/pred_mse_parallel", out_par.loss_mse)
-            self._log_ce_breakdown(out_par, "val_parallel")
-
-        self.log("val/loss", loss_ar, prog_bar=True)
+        loss_ar, out_ar, prep = self.forward_batch(video, inference_mode="autoregressive")
+        log_dict = build_val_log_dict(
+            self,
+            out_ar,
+            prep,
+            loss_total_ar=loss_ar,
+            out_par=out_par,
+            parallel_skipped=parallel_skipped,
+        )
+        self.log_dict(log_dict, logger=True, on_step=False, on_epoch=True)
+        self.log(
+            "val/loss_total_ar",
+            loss_ar,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+        )
         return loss_ar
 
     def _lr_annealing(self) -> None:

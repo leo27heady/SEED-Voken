@@ -65,6 +65,37 @@ def make_comparison_grid(
     return canvas
 
 
+def predictor_rows_to_grid(
+    log: Dict[str, torch.Tensor],
+    t_context: int,
+    t_total: int,
+    cell_size: int = 128,
+    label_width: int = 140,
+    header_height: int = 28,
+) -> Image.Image:
+    """Horizon-focused grid for predictor decode paths (one batch index)."""
+    rows = [
+        ("ground_truth", log["inputs"]),
+        ("vae_recon", log["vae_recon"]),
+        ("pred_train", log["pred_train"]),
+        ("pred_parallel", log["pred_parallel"]),
+        ("pred_ar", log["pred_ar"]),
+    ]
+    frame_indices = list(range(t_context, t_total))
+    sliced = []
+    for name, video in rows:
+        if video.ndim == 5:
+            video = video[0]
+        sliced.append((name, video))
+    return make_comparison_grid(
+        sliced,
+        frame_indices=frame_indices,
+        cell_size=cell_size,
+        label_width=label_width,
+        header_height=header_height,
+    )
+
+
 def videos_to_row_dict(
     inputs: torch.Tensor,
     reconstructions: torch.Tensor,

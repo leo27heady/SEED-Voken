@@ -47,7 +47,7 @@ def main():
     sync()
     t0 = time.perf_counter()
     with torch.autocast("cuda"):
-        loss, out = model.forward_batch(x, inference_mode="train")
+        loss, out, _ = model.forward_batch(x, inference_mode="train")
     sync()
     full = time.perf_counter() - t0
 

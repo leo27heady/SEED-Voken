@@ -12,6 +12,6 @@ def shift_ce_loss(
     codebook_size: int,
 ) -> torch.Tensor:
     return F.cross_entropy(
-        logits.reshape(-1, codebook_size),
+        logits.reshape(-1, codebook_size).float(),
         targets.reshape(-1),
     )

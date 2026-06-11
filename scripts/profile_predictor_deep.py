@@ -50,7 +50,7 @@ def main():
     for _ in range(3):
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda"):
-            loss, _ = model.forward_batch(x, inference_mode="train")
+            loss, _, _ = model.forward_batch(x, inference_mode="train")
         loss.backward()
         opt.step()
     sync()
@@ -60,7 +60,7 @@ def main():
     sync()
     t0 = time.perf_counter()
     with torch.autocast("cuda"):
-        loss, out = model.forward_batch(x, inference_mode="train")
+        loss, out, _ = model.forward_batch(x, inference_mode="train")
     sync()
     fwd = time.perf_counter() - t0
     sync()

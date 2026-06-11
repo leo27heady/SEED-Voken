@@ -237,8 +237,18 @@ python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_64_S_v2_pre
 | Attention | coarse=full rev · mid/fine=factorized |
 | Inference val | parallel + autoregressive logged |
 | `parallel_mode` | `full` = oracle shift-0 embeds; `context` = train-like (OOM-safe) |
+| W&B project | `seed-voken-shapes3d` (`*_predict` run name) |
+| Checkpoint monitor | `val/loss_total_ar` (min, top-3 + last) |
 
-Checkpoints: `checkpoints/predictor/shapes3d_sqvae2_64_S_v2_predict/`
+**Train scalars (W&B):** `train/loss_total`, `train/loss_ce`, `train/loss_pred_mse`, `train/ce_stage_*`, `train/token_acc_stage_*`, `train/ce_over_baseline`, `train/lr`, `lr-AdamW` (LR monitor).
+
+**Val scalars:** `val/loss_total_ar` (prog bar + checkpoint), `val/loss_total_parallel`, `val/loss_ce_ar`, `val/loss_ce_parallel`, `val/pred_mse_ar_per_pixel`, `val/ce_gap_parallel_minus_ar`, `val/token_acc_ar_stage_*`, `val/token_acc_parallel_stage_*`, `val/parallel_skipped`.
+
+**Val media:** horizon frame grids `pred/sample0..N` (GT, VAE recon, train / parallel / AR decode) via `PredictorHorizonLogger`; PNGs under `{default_root_dir}/predictions/`.
+
+Checkpoints: `checkpoints/predictor/sqvae2_64_S_v2_predict/` (ModelCheckpoint `dirpath`; also `default_root_dir` for logs).
+
+**Resume:** set `ckpt_path:` in the predict yaml to a saved `.ckpt`.
 
 **32px lite dev:** use `shapes3d_sqvae2_32_S_lite_predict.yaml` (`parallel_mode: context` default).
 

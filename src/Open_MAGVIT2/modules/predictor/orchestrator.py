@@ -176,7 +176,10 @@ class EnvelopeOrchestrator(nn.Module):
             sup = batch.supervision[s][k]
             q_logits = out.logits[:, sup.query_positions]
             tgt = batch.target_indices[s][k]
-            ce = F.cross_entropy(q_logits.reshape(-1, q_logits.shape[-1]), tgt.reshape(-1))
+            ce = F.cross_entropy(
+                q_logits.reshape(-1, q_logits.shape[-1]).float(),
+                tgt.reshape(-1),
+            )
             ce_breakdown[(s, k)] = ce.detach()
             w = self._ce_weight(s, k)
             loss_ce = ce * w if loss_ce is None else loss_ce + ce * w
