@@ -113,20 +113,31 @@ def test_perplexity_uniform_and_peaked():
     assert out_uni.perplexity.item() > k * 0.5
 
 
-def test_kld_discrete_mean_grid_invariant():
-    """Mean over (T,H,W) makes discrete KL independent of grid size for uniform posteriors."""
+def test_kld_discrete_scales_with_grid_size():
+    """SQ-VAE semantics: discrete KL is summed over latent positions, so for a
+    near-uniform posterior it scales ~linearly with T*H*W (Path A, Phase 1).
+
+    The old behavior (mean over positions and K) made the KL grid-invariant and
+    ~T*H*W*K times too small vs the ARELBO distortion — the codebook-collapse
+    root cause identified in docs/DEEP_REVIEW_2026-06-11.md §1.1.
+    """
     k = 16
     var = torch.tensor([60.0])
 
     def discrete_kl(t_len, h, w):
+        torch.manual_seed(0)
         q = GaussianSQQuantizer(size_dict=k, dim_dict=8)
         z = torch.randn(2, 8, t_len, h, w)
         out = q(z, var_q_pos=var, flg_train=False, flg_quant_det=True)
         return out.aux_loss.item()
 
-    kl_small = discrete_kl(2, 4, 4)
-    kl_large = discrete_kl(5, 16, 16)
-    assert abs(kl_small - kl_large) < 0.5 * max(abs(kl_small), abs(kl_large), 1.0)
+    kl_small = discrete_kl(2, 4, 4)      # 32 positions
+    kl_large = discrete_kl(5, 16, 16)    # 1280 positions
+    ratio = kl_large / kl_small
+    expected = (5 * 16 * 16) / (2 * 4 * 4)
+    assert 0.5 * expected < ratio < 2.0 * expected, (
+        f"KL grid scaling ratio {ratio:.1f}, expected ~{expected:.1f}"
+    )
 
 
 def test_gaussian_sq_perplexity_finite():

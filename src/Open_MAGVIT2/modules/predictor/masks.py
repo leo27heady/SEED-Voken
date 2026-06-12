@@ -23,8 +23,21 @@ def sanitize_cross_attn_mask(cross_m: torch.Tensor | None) -> torch.Tensor | Non
 
 
 class PyramidMaskBuilder:
-    def __init__(self, schedule: PyramidSchedule) -> None:
+    def __init__(
+        self,
+        schedule: PyramidSchedule,
+        cross_spatial_window: int = 0,
+    ) -> None:
+        """cross_spatial_window: parent-neighborhood radius for cross-attn.
+
+        0 (legacy) = each child token sees exactly its single aligned parent
+        cell. With one overlapping parent frame that makes the softmax a
+        constant (one allowed key), so cross q/k projections receive zero
+        gradient at the supervised query frame (review follow-up, Phase 2).
+        1 = 3x3 parent neighborhood, etc.
+        """
         self.schedule = schedule
+        self.cross_spatial_window = int(cross_spatial_window)
 
     def build_self_attn_mask(
         self,
@@ -75,12 +88,20 @@ class PyramidMaskBuilder:
                 )
                 if not parent_frames or child_frames.isdisjoint(parent_frames):
                     continue
-                spatial = self._spatial_block(sp_ratio, n_c, n_p, device)
+                spatial = self._spatial_block(
+                    sp_ratio, n_c, n_p, device, window=self.cross_spatial_window
+                )
                 mask[tc * n_c : (tc + 1) * n_c, tp * n_p : (tp + 1) * n_p] = spatial
         return sanitize_cross_attn_mask(mask)
 
     @staticmethod
-    def _spatial_block(sp_ratio: int, n_c: int, n_p: int, device: torch.device) -> torch.Tensor:
+    def _spatial_block(
+        sp_ratio: int,
+        n_c: int,
+        n_p: int,
+        device: torch.device,
+        window: int = 0,
+    ) -> torch.Tensor:
         side_c = int(n_c ** 0.5)
         side_p = int(n_p ** 0.5)
         if side_p == 1:
@@ -88,11 +109,15 @@ class PyramidMaskBuilder:
         r = torch.arange(side_c, device=device)
         c = torch.arange(side_c, device=device)
         grid_r, grid_c = torch.meshgrid(r, c, indexing="ij")
-        parent_r = grid_r // sp_ratio
-        parent_c = grid_c // sp_ratio
-        parent_idx = (parent_r * side_p + parent_c).reshape(n_c)
+        parent_r = (grid_r // sp_ratio).reshape(n_c)
+        parent_c = (grid_c // sp_ratio).reshape(n_c)
         block = torch.zeros(n_c, n_p, dtype=torch.bool, device=device)
-        block[torch.arange(n_c, device=device), parent_idx] = True
+        child_idx = torch.arange(n_c, device=device)
+        for dr in range(-window, window + 1):
+            for dc in range(-window, window + 1):
+                pr = (parent_r + dr).clamp(0, side_p - 1)
+                pc = (parent_c + dc).clamp(0, side_p - 1)
+                block[child_idx, pr * side_p + pc] = True
         return block
 
     def build_all_masks(
@@ -123,11 +148,12 @@ class PredictorMaskCache(nn.Module):
         self,
         schedule: PyramidSchedule,
         temporal_windows: Sequence[int],
+        cross_spatial_window: int = 0,
     ) -> None:
         super().__init__()
         self._keys: list[tuple[int, int]] = []
         self._has_cross: dict[tuple[int, int], bool] = {}
-        builder = PyramidMaskBuilder(schedule)
+        builder = PyramidMaskBuilder(schedule, cross_spatial_window=cross_spatial_window)
         all_masks = builder.build_all_masks(temporal_windows, torch.device("cpu"))
         for (s, k), masks in sorted(all_masks.items()):
             self._keys.append((s, k))

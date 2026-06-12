@@ -18,6 +18,8 @@ def total_loss(
     lambda_ce: float,
     lambda_pred_mse: float,
 ) -> torch.Tensor:
+    """Legacy diagnostic combination. The optimized loss is CE-only since
+    Path A Phase 2 — pred-MSE decodes argmax indices and carries no gradient."""
     loss = lambda_ce * ce
     if pred_mse is not None and lambda_pred_mse > 0:
         loss = loss + lambda_pred_mse * pred_mse
@@ -81,9 +83,8 @@ def build_train_log_dict(
         "train/loss_ce": out.loss_ce.detach(),
     }
     if out.loss_mse is not None:
+        # already a per-pixel mean over the decoded horizon
         log["train/loss_pred_mse"] = out.loss_mse.detach()
-        n_pix = batch.video[:, :, model.t_context : model.t_total].numel()
-        log["train/pred_mse_per_pixel"] = (out.loss_mse / max(n_pix, 1)).detach()
 
     baseline = ce_baseline(model.schedule)
     log["train/ce_over_baseline"] = (out.loss_ce.detach() / baseline)
@@ -119,9 +120,8 @@ def build_val_log_dict(
         "val/loss_ce_ar": out_ar.loss_ce.detach(),
     }
     if out_ar.loss_mse is not None:
+        # already a per-pixel mean over the decoded horizon
         log["val/pred_mse_ar"] = out_ar.loss_mse.detach()
-        n_pix = batch.video[:, :, model.t_context : model.t_total].numel()
-        log["val/pred_mse_ar_per_pixel"] = (out_ar.loss_mse / max(n_pix, 1)).detach()
 
     for s, ce in aggregate_ce_by_stage(out_ar.ce_breakdown).items():
         log[f"val/ce_ar_stage_{s}"] = ce
@@ -135,27 +135,29 @@ def build_val_log_dict(
     if parallel_skipped:
         log["val/parallel_skipped"] = torch.tensor(1.0)
     elif out_par is not None:
-        loss_total_par = total_loss(
-            out_par.loss_ce,
-            out_par.loss_mse,
-            lambda_ce=model.lambda_ce,
-            lambda_pred_mse=model.lambda_pred_mse,
-        )
-        log["val/loss_total_parallel"] = loss_total_par.detach()
+        # "tf" = teacher-forced/stream-carry mode. With parallel_mode="context"
+        # this is exactly the training computation evaluated on val data (it is
+        # NOT an independent oracle) — review §2.1. Legacy "parallel" keys are
+        # kept for one release for W&B continuity.
+        loss_total_par = (model.lambda_ce * out_par.loss_ce).detach()
+        log["val/loss_total_parallel"] = loss_total_par
         log["val/loss_ce_parallel"] = out_par.loss_ce.detach()
-        log["val/ce_gap_parallel_minus_ar"] = (out_par.loss_ce - out_ar.loss_ce).detach()
+        log["val/loss_ce_tf"] = out_par.loss_ce.detach()
+        gap = (out_par.loss_ce - out_ar.loss_ce).detach()
+        log["val/ce_gap_parallel_minus_ar"] = gap
+        log["val/ce_gap_tf_minus_ar"] = gap
         if out_par.loss_mse is not None:
             log["val/pred_mse_parallel"] = out_par.loss_mse.detach()
-            n_pix = batch.video[:, :, model.t_context : model.t_total].numel()
-            log["val/pred_mse_parallel_per_pixel"] = (
-                out_par.loss_mse / max(n_pix, 1)
-            ).detach()
+            log["val/pred_mse_tf"] = out_par.loss_mse.detach()
         for s, ce in aggregate_ce_by_stage(out_par.ce_breakdown).items():
             log[f"val/ce_parallel_stage_{s}"] = ce
+            log[f"val/ce_tf_stage_{s}"] = ce
         if out_par.ce_breakdown:
             for (s, k), ce in out_par.ce_breakdown.items():
                 log[f"val_parallel/ce_s{s}_k{k}"] = ce
+                log[f"val_tf/ce_s{s}_k{k}"] = ce
         for s, acc in token_accuracy_from_output(out_par, batch, model.schedule).items():
             log[f"val/token_acc_parallel_stage_{s}"] = acc.detach()
+            log[f"val/token_acc_tf_stage_{s}"] = acc.detach()
 
     return log

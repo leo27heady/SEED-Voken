@@ -177,3 +177,21 @@ pred_indices → decode_from_indices(zero acts) → pred MSE on RGB[:,:,t_contex
 ## Conclusion
 
 Path C is **implementation-complete** for the locked training spec. Observability (per-pixel MSE, CE baselines, parallel modes) and repo slimming (sqvae2-only) are done. Treat predictor experiments as **blocked on VAE recon quality** until resume training plateaus.
+
+---
+
+## Addendum 2026-06-11 — review corrections (Path A)
+
+The deep review (DEEP_REVIEW_2026-06-11.md) falsified several "Correct" verdicts
+above. Status after the `path-a/elbo-pyramid` branch:
+
+| Review finding | Original audit verdict | Fix | Status |
+|---|---|---|---|
+| ELBO KL mean-reduced over positions and K (~1e5-1e6x too weak) → codebook collapse | "VAE configs Operational" | KL sums in `gaussian_sq.py`; `kl_beta`/`kl_warmup_steps`/`grad_clip`; tests `test_elbo_scaling.py` | Fixed |
+| All levels down-fused to 3x4x4 latent; mid layer dominates recon (ablation dMSE +0.234 vs +0.020 coarse) | not audited | `temporal_up` u2 + `decoder_source: finest_state` + `dec_ddconfig`; guard `validate_state_chain`; tests `test_pyramid_topdown.py` | Fixed (Run 2 to confirm) |
+| `codebook_proj` frozen at random init (`@torch.no_grad` in batch prep) | "Predictor stages Correct" | embedding moved into grad context; test `test_grad_flow.py` | Fixed |
+| pred-MSE has no gradient, in the loss + ckpt monitor; per-pixel double division | "Lightning/training Correct" | logging-only (`log_pred_mse`), monitor `val/loss_ce_ar`, per-pixel keys dropped | Fixed |
+| `parallel(context)` identical to train mode (not an oracle) | "forward_parallel Correct" | `val/*_tf` aliases + doc note; legacy keys kept one release | Renamed |
+| Fine-stage cross q/k get exact-zero grads (1-to-1 spatial mask, single overlapping parent frame at the query) | "Masks Correct" (MSK-06) | `cross_spatial_window` (3x3 neighborhood); canary test in `test_grad_flow.py` | Fixed (opt-in) |
+| AR finest re-entry never trained; horizon temporal_pos untrained → `val/loss_ce_ar` grows 22→35 | "Inference Partial" | NOT yet fixed — Path C re-entry training (next phase) | Open |
+| Native access-violation crash in full pytest run (test helper built FULL attention over the 13x32x32 fine stage → multi-GB attention matrix under memory pressure; multi-threaded OpenMP made it flakier) | "119+ passing" | factorized mid/fine stages in `test_predictor_logging._build_stack` + single-threaded torch in `tests/conftest.py` | Fixed |

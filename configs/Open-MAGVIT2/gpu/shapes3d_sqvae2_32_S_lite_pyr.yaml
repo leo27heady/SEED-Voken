@@ -1,3 +1,8 @@
+# Path A Run 2: ELBO fix + temporal pyramid (u2) + finest-state decoding.
+# Tokens stay on native tap grids (3x4x4, 5x8x8, 9x16x16) via temporal_up: [2, 2];
+# the decoder consumes the finest 9x16x16 z_state (one spatial upsample) instead
+# of the down-fused 3x4x4 latent — removes the 768-float information bottleneck.
+# Gate after training: python scripts/token_quality_report.py --config <this> --ckpt <best>
 seed_everything: 1234
 trainer:
   accelerator: gpu
@@ -9,11 +14,11 @@ trainer:
   check_val_every_n_epoch: 4
   num_sanity_val_steps: -1
   log_every_n_steps: 100
-  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite_pyr
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite"
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite_pyr"
         monitor: val_ema/mse
         mode: min
         save_top_k: 3
@@ -32,13 +37,13 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: seed-voken-shapes3d
-      name: sqvae2_32_S_lite
+      name: sqvae2_32_S_lite_pyr
       save_dir: ../../results/vqgan/
 
 model:
   class_path: src.Open_MAGVIT2.models.video_hier_vqgan.VideoHierVQModel
   init_args:
-    progressive_coding: false
+    progressive_coding: false   # flip to true for the Path B ablation (per-stage rows)
     ddconfig:
       double_z: False
       z_channels: 16
@@ -49,13 +54,27 @@ model:
       ch_mult: [1, 2, 2, 4]
       num_res_blocks: 1
       num_groups: 8
+    # decoder for the finest 9x16x16 z_state: one spatial doubling, T preserved.
+    # Most blocks now run at 16x16 — if step time is too high, drop ch to 32 first.
+    dec_ddconfig:
+      double_z: False
+      z_channels: 16
+      resolution: 32
+      in_channels: 3
+      out_ch: 3
+      ch: 64
+      ch_mult: [1, 2]
+      num_res_blocks: 2
+      num_groups: 8
     hierarchy:
       mode: sqvae2
-      token_grid: native
+      token_grid: pyramid
       tap_key_format: spatial
       sequence_length: 9
       latent_key: h4_w4
-      blocks_sq: "h4_w4_x1,h8_w8_x1,h16_w16_x1"
+      blocks_sq: "h4_w4_x1,h8_w8_u2,h16_w16_u2"
+      temporal_up: [2, 2]          # T chain 3 -> 5 -> 9 (validated against taps)
+      decoder_source: finest_state
       tap_channels:
         h4_w4: 16
         h8_w8: 64
@@ -63,13 +82,17 @@ model:
     quantizer:
       type: sq
       prior: zero
-      size_dict: [4096, 2048, 1024]
+      size_dict: [4096, 2048, 1024]   # unchanged vs baseline for attribution (Run 3 = size ablation)
       dim_dict: [96, 96, 96]
       log_param_q_init: [4.09434, 4.09434, 4.09434]
       temperature:
         init: 1.0
         decay: 1.0e-5
         min: 0.3
+    loss_cfg:
+      kl_beta: 1.0
+      kl_warmup_steps: 0
+      grad_clip: 1.0
     learning_rate: 1.0e-4
     numerical_debug: false
     training_objective: hq_elbo

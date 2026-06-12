@@ -72,6 +72,42 @@ def validate_hierarchy_taps(
     return audit
 
 
+def validate_state_chain(
+    audit: Dict[str, Tuple[int, ...]],
+    resolution_keys: List[str],
+    layer_upsample: List[bool],
+    temporal_up: List[int],
+) -> None:
+    """Pyramid (u2) guard: the top-down z_state grid must land exactly on each
+    tap grid, otherwise tokens leave the native grids and the predictor's
+    temporal shift hierarchy silently breaks (Path A correction #1).
+
+    Upsampler semantics: spatial x2 per u2; temporal factor 2 yields
+    T -> 2T - 1 (frame-drop), factor 1 keeps T.
+    """
+    if not any(layer_upsample):
+        return
+    first = normalize_resolution_key(resolution_keys[0])
+    t, h, w = audit[first][2], audit[first][3], audit[first][4]
+    u2_idx = 0
+    for key, up in zip(resolution_keys, layer_upsample):
+        nk = normalize_resolution_key(key)
+        if up:
+            t_factor = temporal_up[u2_idx]
+            u2_idx += 1
+            t = 2 * t - 1 if t_factor == 2 else t
+            h, w = h * 2, w * 2
+        expected = (t, h, w)
+        got = tuple(audit[nk][2:])
+        if expected != got:
+            raise ValueError(
+                f"z_state grid {expected} does not match encoder tap {nk} grid {got}. "
+                f"For taps that halve T per level set hierarchy.temporal_up: "
+                f"[2, ...] (one entry per u2 layer); current temporal_up has "
+                f"factor(s) {temporal_up}."
+            )
+
+
 def audit_spatial_taps_at_lengths(
     ddconfig: Dict[str, Any],
     sequence_lengths: List[int],

@@ -23,15 +23,18 @@ from src.Open_MAGVIT2.utils.video_viz import predictor_rows_to_grid
 
 
 def _build_stack():
+    # Smoke-sized encoder: these tests verify metric plumbing, not capacity.
+    # (ch=64/num_res_blocks=2 + full-attention stages used to push peak RSS
+    # into native-crash territory on Windows CPU CI.)
     ddconfig = dict(
         double_z=False, z_channels=32, resolution=64, in_channels=3, out_ch=3,
-        ch=64, ch_mult=[1, 2, 2, 4], num_res_blocks=2,
+        ch=32, ch_mult=[1, 2, 2, 4], num_res_blocks=1, num_groups=8,
     )
     hierarchy = dict(
         mode="sqvae2", token_grid="native", tap_key_format="spatial",
         sequence_length=13, latent_key="h8_w8",
         blocks_sq="h8_w8_x1,h16_w16_x1,h32_w32_x1",
-        tap_channels=dict(h8_w8=32, h16_w16=128, h32_w32=128),
+        tap_channels=dict(h8_w8=32, h16_w16=64, h32_w32=64),
     )
     quantizer = dict(
         type="sq", prior="zero", size_dict=[1536, 768, 384], dim_dict=[32, 32, 32],
@@ -41,10 +44,20 @@ def _build_stack():
         ddconfig=ddconfig, hierarchy=hierarchy, quantizer=quantizer, learning_rate=1e-4,
     )
     schedule = PyramidSchedule.from_v2_64s()
+    # Mid/fine stages use factorized attention as in the production configs.
+    # Full attention on the 13x32x32 fine stage allocates a ~13312^2 attention
+    # matrix per head (multi-GB) and crashes CPU CI with a native access
+    # violation under memory pressure.
+    stage_attn = [
+        dict(attention_type="full"),
+        dict(attention_type="factorized", t_window=3),
+        dict(attention_type="factorized", t_window=1, spatial_window=4),
+    ]
     stages = torch.nn.ModuleList([
         PredictorStage(
             dim=32, n_heads=4, n_layers=2, codebook_size=spec.codebook_size,
             h=spec.H, w=spec.W, max_t=13, max_shifts=4, has_parent=s > 0,
+            **stage_attn[s],
         )
         for s, spec in enumerate(schedule.stages)
     ])

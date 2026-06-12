@@ -10,6 +10,44 @@ End-to-end stack for **causal hierarchical video prediction** on Shapes3D @ 64px
 
 ---
 
+## Path A updates (2026-06, branch `path-a/elbo-pyramid`)
+
+The deep review ([DEEP_REVIEW_2026-06-11.md](./DEEP_REVIEW_2026-06-11.md)) falsified
+several assumptions below; the Path A implementation
+([PATH_A_IMPLEMENTATION_PLAN.md](./PATH_A_IMPLEMENTATION_PLAN.md)) changes:
+
+**Tokenizer**
+- ELBO KL terms are now **summed** over latent positions and K (SQ-VAE semantics);
+  `loss_cfg.kl_beta` / `kl_warmup_steps` / `grad_clip` knobs added. Pre-fix
+  checkpoints trained with KL ~1e5-1e6x too weak (codebook collapse).
+- New hierarchy options: `temporal_up: [2, ...]` (u2 layers double time,
+  T -> 2T-1, keeping tokens on native tap grids — **required** when taps halve T),
+  `decoder_source: finest_state` (decoder consumes the finest pyramid z_state
+  instead of the down-fused bottleneck latent), and model-level `dec_ddconfig`
+  (decoder shaped for the finest grid). Guarded by `validate_state_chain`.
+
+**Predictor**
+- `codebook_proj` now actually trains (was frozen at random init by a blanket
+  `@torch.no_grad` in batch prep).
+- pred-MSE is logging-only (`loss.log_pred_mse`, `pred_mse_every_n_steps`);
+  checkpoints monitor `val/loss_ce_ar`. `lambda_pred_mse` is a deprecated alias.
+- `val/*_tf` metric names alias `val/*_parallel` (with `parallel_mode: context`
+  that mode is the training computation on val data, not an oracle).
+- `predictor.cross_spatial_window: 1` enables a 3x3 parent cross-attn
+  neighborhood. The legacy 1-to-1 mapping gives the supervised query frame a
+  single parent key — softmax over one entry is constant, so cross q/k receive
+  exactly zero gradient (regression-tested in `tests/predictor/test_grad_flow.py`).
+
+**Gate before predictor work**: `python scripts/token_quality_report.py --config <vae yaml> --ckpt <best>`
+(thresholds in the root README; baseline numbers in
+[wandb_analysis/baseline_lite_2026-06-11.md](./wandb_analysis/baseline_lite_2026-06-11.md)).
+
+Known remaining gap (Path C scope, next phase): AR finest-stage re-entry is
+still never trained — `val/ce_s2_k1..k3` divergence persists until the re-entry
+training / scheduled-sampling work lands.
+
+---
+
 ## Architecture (locked spec)
 
 ### Stage geometry @ T=13

@@ -31,13 +31,15 @@ class BatchPrep:
         schedule: PyramidSchedule,
         temporal_windows: List[int],
         mask_cache: PredictorMaskCache | None = None,
+        cross_spatial_window: int = 0,
     ) -> None:
         self.schedule = schedule
         self.temporal_windows = temporal_windows
-        self.mask_builder = PyramidMaskBuilder(schedule)
+        self.mask_builder = PyramidMaskBuilder(
+            schedule, cross_spatial_window=cross_spatial_window
+        )
         self.mask_cache = mask_cache
 
-    @torch.no_grad()
     def build_full_context_embed(
         self,
         gt_indices: Dict[int, torch.Tensor],
@@ -46,10 +48,15 @@ class BatchPrep:
         """Oracle eval: embed full native sequence per stage (context + horizon GT)."""
         return {s: stages[s].embed_indices(gt_indices[s]) for s in gt_indices}
 
-    @torch.no_grad()
     def encode_and_schedule(self, vae, video: torch.Tensor, stages: torch.nn.ModuleList) -> PreparedBatch:
-        """video: (B, C, T, H, W)"""
-        tokens = vae.encode_tokens(video, flg_quant_det=True)
+        """video: (B, C, T, H, W)
+
+        Only the frozen VAE tokenization runs under no_grad. Embedding must stay
+        in the grad context: `stage.codebook_proj` is trainable, and a blanket
+        @torch.no_grad here silently froze it at random init (review §2.1).
+        """
+        with torch.no_grad():
+            tokens = vae.encode_tokens(video, flg_quant_det=True)
         device = video.device
         gt_indices: Dict[int, torch.Tensor] = {}
         context_embed: Dict[int, torch.Tensor] = {}

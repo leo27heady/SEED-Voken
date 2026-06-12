@@ -1,3 +1,6 @@
+# Path A Run 1: ELBO fix only — architecture identical to shapes3d_sqvae2_32_S_lite.
+# Isolates the corrected KL reductions (sum over positions+K) for attribution.
+# Gate after training: python scripts/token_quality_report.py --config <this> --ckpt <best>
 seed_everything: 1234
 trainer:
   accelerator: gpu
@@ -9,11 +12,11 @@ trainer:
   check_val_every_n_epoch: 4
   num_sanity_val_steps: -1
   log_every_n_steps: 100
-  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite_elbofix
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite"
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_32_S_lite_elbofix"
         monitor: val_ema/mse
         mode: min
         save_top_k: 3
@@ -32,7 +35,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: seed-voken-shapes3d
-      name: sqvae2_32_S_lite
+      name: sqvae2_32_S_lite_elbofix
       save_dir: ../../results/vqgan/
 
 model:
@@ -70,6 +73,10 @@ model:
         init: 1.0
         decay: 1.0e-5
         min: 0.3
+    loss_cfg:
+      kl_beta: 1.0          # full ELBO from step 0 (SQ-VAE self-annealing)
+      kl_warmup_steps: 0    # escape hatch: set ~2000 if recon stalls early
+      grad_clip: 1.0        # manual optimization ignores trainer clip
     learning_rate: 1.0e-4
     numerical_debug: false
     training_objective: hq_elbo

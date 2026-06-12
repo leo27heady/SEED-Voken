@@ -17,7 +17,6 @@ from src.Open_MAGVIT2.modules.predictor.config import resolve_stage_attention, s
 from src.Open_MAGVIT2.modules.predictor.metrics import (
     build_train_log_dict,
     build_val_log_dict,
-    total_loss,
 )
 from src.Open_MAGVIT2.modules.predictor.orchestrator import EnvelopeOrchestrator
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule
@@ -74,7 +73,13 @@ class VideoHierPredictorModel(L.LightningModule):
         self.t_context = t_context
         self.t_total = t_total
         self.parent_conditioning = parent_conditioning
-        self.lambda_pred_mse = float(loss.get("lambda_pred_mse", 0.5))
+        # pred-MSE is logging only: it decodes argmax indices through the frozen
+        # VAE, so it can never carry gradient (review §2.2). `lambda_pred_mse`
+        # is accepted as a legacy on/off switch.
+        legacy_lambda = float(loss.get("lambda_pred_mse", 0.5))
+        self.log_pred_mse = bool(loss.get("log_pred_mse", legacy_lambda > 0))
+        self.pred_mse_every_n_steps = int(loss.get("pred_mse_every_n_steps", 50))
+        self.lambda_pred_mse = legacy_lambda
         self.lambda_ce = float(loss.get("lambda_ce", 1.0))
         self.pred_mse_activations = loss.get("pred_mse_activations", "zero")
         self.inference_mode = inference.get("mode", "autoregressive")
@@ -161,6 +166,7 @@ class VideoHierPredictorModel(L.LightningModule):
                 )
             )
         self.predictor_stages = pred_stages
+        cross_window = int(predictor.get("cross_spatial_window", 0))
         self.orchestrator = EnvelopeOrchestrator(
             pred_stages,
             self.schedule,
@@ -170,9 +176,14 @@ class VideoHierPredictorModel(L.LightningModule):
             temporal_windows=temporal_windows,
             commit_mode=self.commit_mode,
         )
-        self.mask_cache = PredictorMaskCache(self.schedule, temporal_windows)
+        self.mask_cache = PredictorMaskCache(
+            self.schedule, temporal_windows, cross_spatial_window=cross_window
+        )
         self.batch_prep = BatchPrep(
-            self.schedule, temporal_windows, mask_cache=self.mask_cache
+            self.schedule,
+            temporal_windows,
+            mask_cache=self.mask_cache,
+            cross_spatial_window=cross_window,
         )
         self._copy_codebooks()
 
@@ -210,20 +221,26 @@ class VideoHierPredictorModel(L.LightningModule):
             encoder_bottleneck=bottleneck,
         ).clamp(-1, 1)
 
+    @torch.no_grad()
     def _decode_horizon_mse(
         self,
         batch,
         pred_indices: Dict[int, torch.Tensor],
     ) -> torch.Tensor:
+        """Logging-only pixel MSE: indices are discrete, so no gradient exists."""
         recon = self._decode_video_from_indices(batch, pred_indices)
         target = batch.video
         horizon = recon[:, :, self.t_context : self.t_total]
         gt = target[:, :, self.t_context : self.t_total]
         return torch.mean((horizon - gt) ** 2)
 
-
-
-    def forward_batch(self, video: torch.Tensor, *, inference_mode: Optional[str] = None):
+    def forward_batch(
+        self,
+        video: torch.Tensor,
+        *,
+        inference_mode: Optional[str] = None,
+        compute_pred_mse: Optional[bool] = None,
+    ):
         # Predictor + large-vocab CE are unstable in fp16 (batch 32, K up to 4096).
         device_type = "cuda" if video.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
@@ -237,13 +254,13 @@ class VideoHierPredictorModel(L.LightningModule):
             else:
                 out = self.orchestrator.forward_train(batch)
 
-            if self.lambda_pred_mse > 0:
+            if compute_pred_mse is None:
+                compute_pred_mse = self.log_pred_mse
+            if compute_pred_mse and self.log_pred_mse:
                 out.loss_mse = self._decode_horizon_mse(batch, out.pred_indices)
 
+            # CE is the only differentiable objective (pred-MSE is logging only).
             total = self.lambda_ce * out.loss_ce
-
-            if out.loss_mse is not None:
-                total = total + self.lambda_pred_mse * out.loss_mse
 
         return total, out, batch
 
@@ -280,7 +297,12 @@ class VideoHierPredictorModel(L.LightningModule):
         if self.trainer is not None and self.trainer.optimizers:
             self._lr_annealing()
 
-        loss, out, prep = self.forward_batch(video, inference_mode="train")
+        compute_mse = self.log_pred_mse and (
+            self.global_step % self.pred_mse_every_n_steps == 0
+        )
+        loss, out, prep = self.forward_batch(
+            video, inference_mode="train", compute_pred_mse=compute_mse
+        )
         log_dict = build_train_log_dict(self, out, prep, loss_total=loss)
         self.log_dict(log_dict, logger=True, on_step=True, on_epoch=True)
         self.log("train/loss_total", loss, prog_bar=True, on_step=True, on_epoch=True)

@@ -24,7 +24,10 @@ from src.Open_MAGVIT2.modules.numerical_debug import (
     set_numerical_debug,
 )
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.hier_elbo_loss import compute_hier_elbo_loss
-from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import validate_hierarchy_taps
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.shape_audit import (
+    validate_hierarchy_taps,
+    validate_state_chain,
+)
 
 
 def _as_float_list(value, name: str) -> Optional[List[float]]:
@@ -81,6 +84,7 @@ class VideoHierVQModel(L.LightningModule):
         ddconfig,
         hierarchy: Dict[str, Any],
         quantizer: Dict[str, Any],
+        dec_ddconfig: Optional[Dict[str, Any]] = None,
         learning_rate: float = 1e-4,
         training_objective: str = "hq_elbo",
         use_gan: bool = False,
@@ -107,7 +111,7 @@ class VideoHierVQModel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(
-            ignore=["ddconfig", "hierarchy", "quantizer", "lossconfig", "loss_cfg"]
+            ignore=["ddconfig", "dec_ddconfig", "hierarchy", "quantizer", "lossconfig", "loss_cfg"]
         )
 
         self.image_key = image_key
@@ -133,12 +137,18 @@ class VideoHierVQModel(L.LightningModule):
 
         loss_cfg = dict(loss_cfg or {})
         self.loss_cfg = loss_cfg
+        self.kl_beta = float(loss_cfg.get("kl_beta", 1.0))
+        self.kl_warmup_steps = int(loss_cfg.get("kl_warmup_steps", 0))
+        self.grad_clip = loss_cfg.get("grad_clip", 1.0)
         num_layers_hint = len(
             _as_float_list(quantizer.get("size_dict"), "size_dict") or [2]
         )
 
         self.encoder = Encoder(**ddconfig)
-        self.decoder = Decoder(**ddconfig)
+        # dec_ddconfig allows a decoder shaped for a different latent grid than
+        # the encoder bottleneck (e.g. decoder_source: finest_state consumes the
+        # finest pyramid z_state and only needs one spatial upsample).
+        self.decoder = Decoder(**(dec_ddconfig if dec_ddconfig is not None else ddconfig))
         z_channels = ddconfig["z_channels"]
 
         hierarchy = dict(hierarchy)
@@ -155,13 +165,20 @@ class VideoHierVQModel(L.LightningModule):
             and self.hierarchy_mode == "sqvae2"
             and hasattr(self.hier_quant, "resolution_keys")
         ):
-            validate_hierarchy_taps(
+            audit = validate_hierarchy_taps(
                 ddconfig,
                 int(tap_seq_len),
                 list(self.hier_quant.resolution_keys),
                 hierarchy.get("tap_channels"),
                 tap_key_format=hierarchy.get("tap_key_format", "spatial"),
             )
+            if getattr(self.hier_quant, "has_u2", False):
+                validate_state_chain(
+                    audit,
+                    list(self.hier_quant.resolution_keys),
+                    list(self.hier_quant.layer_upsample),
+                    list(self.hier_quant.temporal_up),
+                )
         if hasattr(self.hier_quant, "num_layers"):
             num_layers_hint = self.hier_quant.num_layers
         self.kl_weights = _build_kl_weights_tensor(
@@ -232,6 +249,31 @@ class VideoHierVQModel(L.LightningModule):
         tau = max(self.temp_min, self.temp_init * math.exp(-self.temp_decay * step))
         set_all_sq_temperature(self.hier_quant, tau)
         return tau
+
+    def _current_kl_beta(self, step: Optional[int] = None) -> float:
+        if step is None:
+            step = self.global_step
+        beta = self.kl_beta
+        if self.kl_warmup_steps > 0:
+            beta *= min(1.0, (step + 1) / self.kl_warmup_steps)
+        return beta
+
+    def _effective_kl_weights(self, device, beta: float) -> Optional[torch.Tensor]:
+        """Per-layer KL weights scaled by the warm-up beta (None if all 1.0)."""
+        if self.kl_weights is not None:
+            return self.kl_weights.to(device) * beta
+        if beta != 1.0:
+            num_layers = getattr(self.hier_quant, "num_layers", 1)
+            return torch.full((num_layers,), beta, dtype=torch.float32, device=device)
+        return None
+
+    def _clip_manual_gradients(self, opt) -> None:
+        if self.grad_clip:
+            self.clip_gradients(
+                opt,
+                gradient_clip_val=float(self.grad_clip),
+                gradient_clip_algorithm="norm",
+            )
 
     def on_train_start(self) -> None:
         set_numerical_debug(self.numerical_debug, fail_fast=True)
@@ -356,14 +398,13 @@ class VideoHierVQModel(L.LightningModule):
                 wp_it = self.wp_iter
             self.lr_annealing(self.learning_rate, g_it, wp_it, max_it, wp0=self.wp0, wpe=self.wpe)
 
+        kl_beta = self._current_kl_beta()
         if (
             self.recon_loss is not None
             and getattr(self.recon_loss, "use_discriminator", False)
         ):
             opt_gen, opt_disc = self.optimizers()
-            kl_w = self.kl_weights
-            if kl_w is not None:
-                kl_w = kl_w.to(x.device)
+            kl_w = self._effective_kl_weights(x.device, kl_beta)
             base_loss, log_dict = compute_hier_elbo_loss(
                 x,
                 x_rec,
@@ -387,6 +428,7 @@ class VideoHierVQModel(L.LightningModule):
             log_dict.update(_layer_codebook_usage_logs(layer_results, "train"))
             opt_gen.zero_grad()
             self.manual_backward(loss)
+            self._clip_manual_gradients(opt_gen)
             opt_gen.step()
 
             discloss, disc_log = self.recon_loss(
@@ -399,13 +441,12 @@ class VideoHierVQModel(L.LightningModule):
             )
             opt_disc.zero_grad()
             self.manual_backward(discloss)
+            self._clip_manual_gradients(opt_disc)
             opt_disc.step()
             log_dict.update(disc_log)
         else:
             opt = self.optimizers()
-            kl_w = self.kl_weights
-            if kl_w is not None:
-                kl_w = kl_w.to(x.device)
+            kl_w = self._effective_kl_weights(x.device, kl_beta)
             loss, log_dict = compute_hier_elbo_loss(
                 x,
                 x_rec,
@@ -430,6 +471,7 @@ class VideoHierVQModel(L.LightningModule):
             log_dict.update(_layer_codebook_usage_logs(layer_results, "train"))
             opt.zero_grad()
             self.manual_backward(loss)
+            self._clip_manual_gradients(opt)
             opt.step()
 
         if self.numerical_debug:
@@ -442,6 +484,7 @@ class VideoHierVQModel(L.LightningModule):
         log_dict["train/temperature"] = torch.tensor(
             max(self.temp_min, self.temp_init * math.exp(-self.temp_decay * self.global_step))
         )
+        log_dict["train/kl_beta"] = torch.tensor(kl_beta)
         self.log_dict(
             {k: v for k, v in log_dict.items()},
             prog_bar=True,

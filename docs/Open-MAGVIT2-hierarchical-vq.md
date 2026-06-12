@@ -116,3 +116,66 @@ After VAE training, set `vae_ckpt` in `shapes3d_sqvae2_64_S_v2_predict.yaml` and
 python -m pytest tests/test_encoder_v2.py tests/test_hierarchical_vq.py -q
 python -m pytest tests/predictor/ -q
 ```
+
+---
+
+## Path A (2026-06): corrected ELBO + temporal pyramid + finest-state decoding
+
+### ELBO reductions (gaussian_sq.py)
+
+The categorical KL now follows SQ-VAE/HQ-VAE semantics: an expectation over K
+(sum) accumulated over all latent positions (sum over T,H,W), batch-averaged.
+The continuous term (flg_loss_continuous layers) is likewise summed over
+(C,T,H,W). Both are computed in fp32 under AMP. Previous behavior used means,
+shrinking the KL by T*H*W*K relative to the ARELBO distortion and disabling
+variance self-annealing (root cause of the observed codebook collapse —
+see DEEP_REVIEW_2026-06-11.md section 1.1).
+
+New `loss_cfg` knobs on `VideoHierVQModel`:
+
+```yaml
+loss_cfg:
+  kl_beta: 1.0          # global KL scale (folds into kl_weights)
+  kl_warmup_steps: 0    # linear beta warm-up; escape hatch if recon stalls
+  grad_clip: 1.0        # manual optimization ignores trainer gradient_clip_val
+```
+
+### Temporal pyramid (u2) and finest-state decoding
+
+```yaml
+hierarchy:
+  token_grid: pyramid
+  blocks_sq: "h4_w4_x1,h8_w8_u2,h16_w16_u2"
+  temporal_up: [2, 2]            # one entry per u2 layer; 2 => T -> 2T-1
+  decoder_source: finest_state   # decoder consumes finest z_state (default: latent)
+```
+
+- `temporal_up: 2` makes the u2 Upsampler use block size (2,2,2); the
+  frame-drop rule yields T -> 2T-1, exactly matching the causal encoder chain
+  (3 -> 5 -> 9 for the 32px lite setup). This keeps every level's tokens on the
+  native tap grids, so the predictor's 1/2/4 shift hierarchy is unchanged.
+  `validate_state_chain` (shape_audit.py) fails fast on any mismatch.
+- `decoder_source: finest_state` returns the post-final-injection z_state
+  (e.g. (B,16,9,16,16)) from forward/decode_from_indices instead of the
+  down-fused bottleneck latent — removing the 3x4x4 information bottleneck.
+  Progressive partials are aligned to the finest grid so one decoder renders
+  every stage row.
+- `dec_ddconfig` (model-level) shapes the decoder for the finest grid, e.g.
+  one spatial doubling and no temporal upsampling:
+
+```yaml
+dec_ddconfig:
+  z_channels: 16
+  ch: 64
+  ch_mult: [1, 2]      # ch_mult[0]==1 => single (1,2,2) Upsampler
+  num_res_blocks: 2
+  num_groups: 8
+  out_ch: 3
+  in_channels: 3
+  resolution: 32
+  double_z: false
+```
+
+Defaults (`decoder_source: latent`, no `temporal_up`, no `dec_ddconfig`)
+preserve the legacy behavior bit-for-bit; old checkpoints load unchanged.
+Tests: tests/test_elbo_scaling.py, tests/test_pyramid_topdown.py.

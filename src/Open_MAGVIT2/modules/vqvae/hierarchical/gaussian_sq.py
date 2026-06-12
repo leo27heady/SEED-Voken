@@ -165,7 +165,10 @@ class GaussianSQQuantizer(LayerQuantizer):
         )
         if dbg:
             check_tensor("sq/logit_pos", logit_pos)
-        prob_pos = F.softmax(logit_pos.float(), dim=-1).to(dtype=z.dtype)
+        # fp32 posterior is kept for the KL: the summed reduction accumulates
+        # T*H*W*K terms and would lose precision in fp16 under AMP.
+        prob_pos_f32 = F.softmax(logit_pos.float(), dim=-1)
+        prob_pos = prob_pos_f32.to(dtype=z.dtype)
         log_prob_pos = F.log_softmax(logit_pos, dim=-1)
         log_prob_pri = self._log_prob_prior(prob_pos, logit_pos, z_pri, var_q_pri)
 
@@ -204,15 +207,21 @@ class GaussianSQQuantizer(LayerQuantizer):
             -torch.sum(avg_probs_k * torch.log(avg_probs_k + 1e-7))
         )
 
+        # ELBO reductions follow SQ-VAE/HQ-VAE: the categorical KL is an
+        # expectation over K (sum) accumulated over all latent positions
+        # (sum over T,H,W); only the batch dimension is averaged. Means here
+        # would shrink the KL by T*H*W*K (~1e5-1e6) relative to the ARELBO
+        # distortion and disable SQ-VAE's variance self-annealing.
         kld_discrete = (
-            prob_pos * (log_prob_pos - log_prob_pri)
-        ).mean(dim=(1, 2, 3, 4)).mean()
+            (prob_pos_f32 * (log_prob_pos.float() - log_prob_pri.float()))
+            .sum(dim=(1, 2, 3, 4))
+        ).mean()
 
         if self.flg_loss_continuous:
             precision_sum = 1.0 / torch.clamp(var_q_pos.sum(), min=1e-10)
             kld_continuous = (
-                (z - z_to_decoder).pow(2).mean(dim=(1, 2, 3, 4))
-                * (0.5 * precision_sum)
+                (z - z_to_decoder).float().pow(2).sum(dim=(1, 2, 3, 4))
+                * (0.5 * precision_sum.float())
             ).mean()
             aux_loss = kld_discrete + kld_continuous
         else:

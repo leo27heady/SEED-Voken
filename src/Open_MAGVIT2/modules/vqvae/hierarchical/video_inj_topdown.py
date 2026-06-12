@@ -77,7 +77,14 @@ def _codebook_size(quantizer: nn.Module) -> int:
 
 
 class InjSQBlock(nn.Module):
-    """Upsample z_state then inject via posterior MLP (HQ u2 path)."""
+    """Upsample z_state then inject via posterior MLP (HQ u2 path).
+
+    ``up_block_size`` controls the state upsampling. (1, 2, 2) is the legacy
+    spatial-only doubling; (2, 2, 2) also doubles time (Upsampler's frame-drop
+    yields T -> 2T - 1, matching the causal encoder chain 3 -> 5 -> 9), which
+    is required to keep per-level token grids on the native tap grids and
+    preserve the 1/2/4 temporal shift hierarchy of the predictor.
+    """
 
     def __init__(
         self,
@@ -85,10 +92,11 @@ class InjSQBlock(nn.Module):
         act_channels: int,
         width: int,
         quantizer: nn.Module,
+        up_block_size: Tuple[int, int, int] = (1, 2, 2),
     ):
         super().__init__()
         self.quantizer = quantizer
-        self.spatial_up = Upsampler(z_channels, block_size=(1, 2, 2))
+        self.spatial_up = Upsampler(z_channels, block_size=tuple(up_block_size))
         self.act_proj = (
             nn.Identity()
             if act_channels == z_channels
@@ -242,6 +250,35 @@ class SQVAE2TopDown(nn.Module):
         self.layer_upsample = [spec[1] for spec in layer_specs]
         self.has_u2 = any(self.layer_upsample)
 
+        # Per-u2-layer temporal upsampling factor (1 = legacy spatial-only,
+        # 2 = double time as well; required when taps halve T per level).
+        n_u2 = sum(self.layer_upsample)
+        temporal_up = hierarchy_cfg.get("temporal_up")
+        if temporal_up is None:
+            temporal_up = [1] * n_u2
+        if not isinstance(temporal_up, (list, tuple)):
+            temporal_up = [temporal_up] * n_u2
+        temporal_up = [int(t) for t in temporal_up]
+        if len(temporal_up) != n_u2:
+            raise ValueError(
+                f"hierarchy.temporal_up length {len(temporal_up)} != number of u2 layers {n_u2}"
+            )
+        if any(t not in (1, 2) for t in temporal_up):
+            raise ValueError(f"hierarchy.temporal_up entries must be 1 or 2, got {temporal_up}")
+        self.temporal_up = temporal_up
+
+        self.decoder_source = str(hierarchy_cfg.get("decoder_source", "latent")).lower()
+        if self.decoder_source not in ("latent", "finest_state"):
+            raise ValueError(
+                f"hierarchy.decoder_source must be 'latent' or 'finest_state', "
+                f"got {self.decoder_source!r}"
+            )
+        if self.decoder_source == "finest_state" and not self.has_u2:
+            raise ValueError(
+                "decoder_source: finest_state requires at least one u2 layer "
+                "(token_grid: pyramid) so a z_state pyramid exists"
+            )
+
         latent_key = hierarchy_cfg.get("latent_key")
         if latent_key is None:
             latent_key = self.resolution_keys[0]
@@ -302,6 +339,7 @@ class SQVAE2TopDown(nn.Module):
 
         prior_heads = nn.ModuleDict()
         blocks = []
+        u2_seen = 0
         for i, (res_key, upsample) in enumerate(layer_specs):
             act_ch = tap_channels.get(res_key, z_channels)
             if lc_cfg == "auto":
@@ -346,12 +384,15 @@ class SQVAE2TopDown(nn.Module):
                     raise ValueError(
                         "u2 layers require token_grid: pyramid (or use xN-only native config)"
                     )
+                t_up = self.temporal_up[u2_seen]
+                u2_seen += 1
                 blocks.append(
                     InjSQBlock(
                         z_channels=z_channels,
                         act_channels=act_ch,
                         width=width,
                         quantizer=q,
+                        up_block_size=(t_up, 2, 2),
                     )
                 )
             else:
@@ -507,6 +548,9 @@ class SQVAE2TopDown(nn.Module):
                     result.aux_loss.reshape(1),
                 )
 
+        if self.decoder_source == "finest_state":
+            assert z_state is not None
+            return z_state, results
         return z_latent, results
 
     def forward_progressive(
@@ -565,8 +609,18 @@ class SQVAE2TopDown(nn.Module):
                     z_pri=z_pri,
                     var_q_pri=var_q_pri,
                 )
-            partial.append(z_latent.clone())
+            if self.decoder_source == "finest_state":
+                assert z_state is not None
+                partial.append(z_state.clone())
+            else:
+                partial.append(z_latent.clone())
 
+        if self.decoder_source == "finest_state":
+            # Align intermediate-state partials to the finest grid so a single
+            # decoder can render every progressive stage.
+            finest_thw = partial[-1].shape[2:]
+            partial = [align_spatial(p, finest_thw) for p in partial]
+            return partial[-1], partial
         return z_latent, partial
 
     def decode_from_indices(
@@ -603,6 +657,9 @@ class SQVAE2TopDown(nn.Module):
                     z_state = z_state + z_q
                 z_latent = z_latent + fuse_to_latent(z_q, latent_thw)
 
+        if self.decoder_source == "finest_state":
+            assert z_state is not None
+            return z_state
         return z_latent
 
     def level_metadata(self, layer_index: int) -> Dict[str, Any]:
