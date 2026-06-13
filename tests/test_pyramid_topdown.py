@@ -121,6 +121,25 @@ def test_schedule_invariant_between_native_and_pyramid():
     assert native._context_end == pyr._context_end
 
 
+def test_log_param_q_max_clamps_variance():
+    import math
+
+    cfg = dict(QUANT_CFG)
+    cfg["log_param_q_max"] = 4.5
+    td = build_top_down(
+        hierarchy_cfg=dict(PYR_HIERARCHY), quantizer_cfg=cfg, z_channels=Z_CH, width=16
+    )
+    with torch.no_grad():
+        td.log_param_q_scalar.fill_(10.0)  # runaway scenario
+    v = td._var_q_slice(0, td.num_layers - 1)
+    assert v.max().item() <= math.exp(4.5) * (1 + 1e-5)
+    # gradient must still flow below the ceiling
+    with torch.no_grad():
+        td.log_param_q_scalar.fill_(2.0)
+    v = td._var_q_slice(0, td.num_layers - 1)
+    assert torch.allclose(v, torch.full_like(v, math.exp(2.0)))
+
+
 def test_state_chain_guard():
     audit = {
         "h4_w4": (1, Z_CH, 3, 4, 4),

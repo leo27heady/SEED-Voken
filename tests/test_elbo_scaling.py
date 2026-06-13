@@ -114,6 +114,27 @@ def test_kl_beta_warmup_schedule():
     assert w is not None and torch.allclose(w, torch.full((3,), 0.25))
 
 
+def test_temporal_kl_smoothness_prior():
+    """w * KL(q_t || sg(q_{t-1})): zero for temporally constant input, positive
+    for changing input, exactly zero contribution when weight is 0."""
+    torch.manual_seed(0)
+    K, D = 8, 4
+    q_off = GaussianSQQuantizer(size_dict=K, dim_dict=D, prior="zero")
+    q_on = GaussianSQQuantizer(size_dict=K, dim_dict=D, prior="zero", temporal_kl_weight=1.0)
+    q_on.codebook.data.copy_(q_off.codebook.data)
+    var = torch.tensor([0.7])
+
+    z_changing = torch.randn(2, D, 4, 2, 2)
+    base = q_off(z_changing, var_q_pos=var, flg_train=True).aux_loss
+    with_prior = q_on(z_changing, var_q_pos=var, flg_train=True).aux_loss
+    assert with_prior.item() > base.item(), "temporal KL should add positive cost for changing input"
+
+    z_const = torch.randn(2, D, 1, 2, 2).repeat(1, 1, 4, 1, 1)
+    base_c = q_off(z_const, var_q_pos=var, flg_train=True).aux_loss
+    with_c = q_on(z_const, var_q_pos=var, flg_train=True).aux_loss
+    assert torch.allclose(base_c, with_c, atol=1e-5), "constant stream must incur no temporal KL"
+
+
 def test_kl_beta_default_is_identity():
     with open(LITE_CFG, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)["model"]["init_args"]

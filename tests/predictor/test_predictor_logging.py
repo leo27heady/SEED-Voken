@@ -1,4 +1,4 @@
-"""Predictor logging metrics, log_images, and horizon callback smoke tests."""
+﻿"""Predictor logging metrics, log_images, and horizon callback smoke tests."""
 
 from unittest.mock import MagicMock
 
@@ -23,47 +23,10 @@ from src.Open_MAGVIT2.utils.video_viz import predictor_rows_to_grid
 
 
 def _build_stack():
-    # Smoke-sized encoder: these tests verify metric plumbing, not capacity.
-    # (ch=64/num_res_blocks=2 + full-attention stages used to push peak RSS
-    # into native-crash territory on Windows CPU CI.)
-    ddconfig = dict(
-        double_z=False, z_channels=32, resolution=64, in_channels=3, out_ch=3,
-        ch=32, ch_mult=[1, 2, 2, 4], num_res_blocks=1, num_groups=8,
-    )
-    hierarchy = dict(
-        mode="sqvae2", token_grid="native", tap_key_format="spatial",
-        sequence_length=13, latent_key="h8_w8",
-        blocks_sq="h8_w8_x1,h16_w16_x1,h32_w32_x1",
-        tap_channels=dict(h8_w8=32, h16_w16=64, h32_w32=64),
-    )
-    quantizer = dict(
-        type="sq", prior="zero", size_dict=[1536, 768, 384], dim_dict=[32, 32, 32],
-        log_param_q_init=[4.09434] * 3, temperature=dict(init=1.0, decay=1e-5, min=0.3),
-    )
-    vae = VideoHierVQModel(
-        ddconfig=ddconfig, hierarchy=hierarchy, quantizer=quantizer, learning_rate=1e-4,
-    )
-    schedule = PyramidSchedule.from_v2_64s()
-    # Mid/fine stages use factorized attention as in the production configs.
-    # Full attention on the 13x32x32 fine stage allocates a ~13312^2 attention
-    # matrix per head (multi-GB) and crashes CPU CI with a native access
-    # violation under memory pressure.
-    stage_attn = [
-        dict(attention_type="full"),
-        dict(attention_type="factorized", t_window=3),
-        dict(attention_type="factorized", t_window=1, spatial_window=4),
-    ]
-    stages = torch.nn.ModuleList([
-        PredictorStage(
-            dim=32, n_heads=4, n_layers=2, codebook_size=spec.codebook_size,
-            h=spec.H, w=spec.W, max_t=13, max_shifts=4, has_parent=s > 0,
-            **stage_attn[s],
-        )
-        for s, spec in enumerate(schedule.stages)
-    ])
-    prep = BatchPrep(schedule, [-1, 3, 1])
-    orch = EnvelopeOrchestrator(stages, schedule, lambda_pred_mse=0.5)
-    return vae, prep, orch, stages, schedule
+    # Shared memory-safe stack (see tests/predictor/stack_factory.py).
+    from tests.predictor.stack_factory import v2_stack
+
+    return v2_stack(n_layers=2, lambda_pred_mse=0.5)
 
 
 class _MockModel:
@@ -101,9 +64,10 @@ def test_token_accuracy_from_output():
     torch.manual_seed(0)
     vae, prep, orch, stages, schedule = _build_stack()
     vae.eval()
-    video = torch.randn(2, 3, 13, 64, 64)
-    batch = prep.encode_and_schedule(vae, video, stages)
-    out = orch.forward_train(batch)
+    video = torch.randn(1, 3, 13, 64, 64)
+    with torch.no_grad():
+        batch = prep.encode_and_schedule(vae, video, stages)
+        out = orch.forward_train(batch)
     acc = token_accuracy_from_output(out, batch, schedule)
     assert len(acc) == schedule.S
     for s, a in acc.items():
@@ -114,10 +78,11 @@ def test_build_train_log_dict_keys():
     torch.manual_seed(1)
     vae, prep, orch, stages, schedule = _build_stack()
     vae.eval()
-    video = torch.randn(2, 3, 13, 64, 64)
-    batch = prep.encode_and_schedule(vae, video, stages)
-    batch.video = video
-    out = orch.forward_train(batch)
+    video = torch.randn(1, 3, 13, 64, 64)
+    with torch.no_grad():
+        batch = prep.encode_and_schedule(vae, video, stages)
+        batch.video = video
+        out = orch.forward_train(batch)
     mock = _MockModel(schedule)
     loss = total_loss(out.loss_ce, out.loss_mse, lambda_ce=1.0, lambda_pred_mse=0.5)
     log = build_train_log_dict(mock, out, batch, loss_total=loss)
@@ -133,10 +98,11 @@ def test_build_val_log_dict_keys():
     vae, prep, orch, stages, schedule = _build_stack()
     vae.eval()
     video = torch.randn(1, 3, 13, 64, 64)
-    batch = prep.encode_and_schedule(vae, video, stages)
-    batch.video = video
-    out_ar = orch.forward_train(batch)
-    out_par = orch.forward_train(batch)
+    with torch.no_grad():
+        batch = prep.encode_and_schedule(vae, video, stages)
+        batch.video = video
+        out_ar = orch.forward_train(batch)
+        out_par = orch.forward_train(batch)
     mock = _MockModel(schedule)
     loss_ar = total_loss(out_ar.loss_ce, None, lambda_ce=1.0, lambda_pred_mse=0.5)
     log = build_val_log_dict(

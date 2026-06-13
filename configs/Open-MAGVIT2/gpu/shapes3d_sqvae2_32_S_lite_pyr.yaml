@@ -22,6 +22,12 @@ trainer:
         monitor: val_ema/mse
         mode: min
         save_top_k: 3
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_ema/mse
+        mode: min
+        patience: 10
+        min_delta: 0.0
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
         logging_interval: step
@@ -85,6 +91,12 @@ model:
       size_dict: [4096, 2048, 1024]   # unchanged vs baseline for attribution (Run 3 = size ablation)
       dim_dict: [96, 96, 96]
       log_param_q_init: [4.09434, 4.09434, 4.09434]
+      log_param_q_max: 5.0   # variance ceiling (see elbofix config note)
+      # Run 2b knob (enable ONLY if G2 persistence fails on this run):
+      # temporal consistency prior w * KL(q_t || sg(q_{t-1})) per layer —
+      # raw magnitudes ~ positions * nats, so these give a gentle ~10-100
+      # loss contribution vs distortion ~5e4:
+      # temporal_kl_weight: [0.25, 0.1, 0.0]
       temperature:
         init: 1.0
         decay: 1.0e-5
@@ -120,7 +132,7 @@ data:
           size: 32
           mode: train
           sequence_length: 9
-          dataset_size: 50000
+          dataset_size: 50000  # full set (existing cache); small sets overfit (see elbofix note)
           cache: true
           shape_scene_type: DIM_3
           shape_min_cubes: 2

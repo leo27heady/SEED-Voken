@@ -61,6 +61,7 @@ class GaussianSQQuantizer(LayerQuantizer):
         usage_reg_weight: float = 0.0,
         usage_reg_target_perplexity: float = 0.0,
         in_channels: int | None = None,
+        temporal_kl_weight: float = 0.0,
     ):
         super().__init__()
         self.size_dict = size_dict
@@ -71,6 +72,12 @@ class GaussianSQQuantizer(LayerQuantizer):
         self.prior = prior.lower()
         self.usage_reg_weight = float(usage_reg_weight)
         self.usage_reg_target_perplexity = float(usage_reg_target_perplexity)
+        # Optional temporal consistency prior: w * KL(q_t || sg(q_{t-1})) summed
+        # over positions, batch-averaged. Pulls each position's posterior toward
+        # its previous-frame posterior (stop-gradient target — one-directional,
+        # so it cannot collapse the whole stream to a constant). Targets the
+        # token-persistence gate (G2): smooth inputs should yield smooth codes.
+        self.temporal_kl_weight = float(temporal_kl_weight)
         self.codebook = nn.Parameter(torch.randn(size_dict, dim_dict))
         if self.in_channels != dim_dict:
             self.in_proj = nn.Conv3d(self.in_channels, dim_dict, kernel_size=1)
@@ -228,6 +235,14 @@ class GaussianSQQuantizer(LayerQuantizer):
             aux_loss = kld_discrete
         if dbg:
             check_tensor("sq/aux_loss", aux_loss.unsqueeze(0))
+
+        if self.temporal_kl_weight > 0.0 and t_len > 1:
+            log_q = log_prob_pos.float()
+            temporal_kl = (
+                (prob_pos_f32[:, 1:] * (log_q[:, 1:] - log_q[:, :-1].detach()))
+                .sum(dim=(1, 2, 3, 4))
+            ).mean()
+            aux_loss = aux_loss + self.temporal_kl_weight * temporal_kl
 
         if self.usage_reg_weight > 0.0 and self.usage_reg_target_perplexity > 0.0:
             usage_reg = self.usage_reg_weight * (

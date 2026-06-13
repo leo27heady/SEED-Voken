@@ -6,6 +6,7 @@ This repository is scoped to **Path C**: causal hierarchical **SQ-VAE-2** tokeni
 
 **Primary docs:**
 
+- [docs/PROJECT_MEMORY.md](./docs/PROJECT_MEMORY.md) — **living context: all findings, decisions, run history, next steps — read first**
 - [docs/PATH_C_README.md](./docs/PATH_C_README.md) — training playbook (VAE → predictor)
 - [docs/PATH_C_AUDIT.md](./docs/PATH_C_AUDIT.md) — architecture audit & test status
 - [docs/Open-MAGVIT2-hierarchical-vq.md](./docs/Open-MAGVIT2-hierarchical-vq.md) — SQ-VAE-2 tokenizer details
@@ -32,7 +33,8 @@ python -m venv venv
 pip install -r requirements.txt
 $env:PYTHONPATH = (Get-Location).Path
 
-python -m pytest tests/ -q   # single-threaded torch enforced by tests/conftest.py
+python -m pytest tests/ -q   # single-threaded torch + 12 GiB RSS watchdog (tests/conftest.py)
+# memory-measured run: python scripts/run_tests_with_peak_rss.py tests -q
 ```
 
 ## Configs (Path C only)

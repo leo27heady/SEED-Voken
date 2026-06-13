@@ -41,7 +41,10 @@ def parse_args():
     p.add_argument("--json", default=None, help="write metrics to this JSON file")
     p.add_argument("--min-perplexity-frac", type=float, default=0.10)
     p.add_argument("--min-coarse-persistence", type=float, default=0.5)
-    p.add_argument("--max-recon-mse", type=float, default=0.0028)
+    # 0.0028 was the KL-free baseline AE's distortion; a properly KL-regularized
+    # ELBO model sits at a different rate-distortion point. 0.005 keeps shapes
+    # clearly recognizable while leaving room for real KL pressure.
+    p.add_argument("--max-recon-mse", type=float, default=0.005)
     p.add_argument("--device", default=None)
     return p.parse_args()
 
@@ -102,6 +105,7 @@ def token_stats(idx, K):
         prev_counts.scatter_add_(0, prev_ids, cnt.float())
         p_prev = prev_counts[prev_ids] / cnt.sum()
         cond_entropy = -(joint * (joint / p_prev).log()).sum().item()
+    mi = marginal_entropy - cond_entropy if cond_entropy == cond_entropy else float("nan")
     return {
         "grid": [t, h, w],
         "K": K,
@@ -111,6 +115,10 @@ def token_stats(idx, K):
         "persistence": persistence,
         "marginal_entropy_nats": marginal_entropy,
         "cond_entropy_nats": cond_entropy,
+        # temporal mutual information: how many nats the previous token at the
+        # same position gives about the next one. More robust than exact-match
+        # persistence when posteriors are sharp over many neighboring codes.
+        "temporal_mi_nats": mi,
     }
 
 
@@ -160,15 +168,16 @@ def main():
 
     S = len(stats)
     print(f"\n## Token quality report ({n_videos} val videos)\n")
-    print("| layer | grid | K | unique | ppl | ppl/K | persistence | H(marg) | H(next\\|prev) | abl dMSE | keep-only MSE |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| layer | grid | K | unique | ppl | ppl/K | persistence | H(marg) | H(next\\|prev) | MI | abl dMSE | keep-only MSE |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for s in range(S):
         st = stats[s]
         print(
             f"| L{s + 1} | {tuple(st['grid'])} | {st['K']} | {st['unique_codes']} "
             f"| {st['perplexity']:.1f} | {st['perplexity_frac']:.3f} "
             f"| {st['persistence']:.3f} | {st['marginal_entropy_nats']:.2f} "
-            f"| {st['cond_entropy_nats']:.2f} | {deltas[s]:+.4f} | {keep_only[s]:.4f} |"
+            f"| {st['cond_entropy_nats']:.2f} | {st['temporal_mi_nats']:.2f} "
+            f"| {deltas[s]:+.4f} | {keep_only[s]:.4f} |"
         )
     print(f"\nrecon MSE (per pixel, {args.ablation_videos} videos): {base_mse:.5f}")
 

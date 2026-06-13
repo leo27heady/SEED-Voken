@@ -1,4 +1,4 @@
-"""PredictorStage unit tests."""
+﻿"""PredictorStage unit tests."""
 
 import torch
 
@@ -7,8 +7,22 @@ from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule, ShiftMa
 from src.Open_MAGVIT2.modules.predictor.stage import PredictorStage
 
 
+def _lite_sched():
+    """Lite 32px geometry (h4/h8/h16, T 3/5/9). Full attention on the fine
+    stage here costs an 85 MB attention matrix vs ~2.8 GB on the v2 64px
+    geometry - same code paths, CI-safe memory."""
+    from src.Open_MAGVIT2.modules.predictor.schedule import StageSpec
+
+    stages = (
+        StageSpec("h4_w4", 4, 4, 1536, 32),
+        StageSpec("h8_w8", 8, 8, 768, 32),
+        StageSpec("h16_w16", 16, 16, 384, 32),
+    )
+    return PyramidSchedule.from_stage_specs(stages, t_context=5, t_total=9)
+
+
 def _stage(s=2, attention_type="full"):
-    sched = PyramidSchedule.from_v2_64s()
+    sched = _lite_sched()
     spec = sched.stages[s]
     return PredictorStage(
         dim=32, n_heads=4, n_layers=2, codebook_size=spec.codebook_size,
@@ -43,24 +57,9 @@ def test_stg_03_mid_two_shifts_ce():
 
 
 def test_stg_05_codebook_match_vae():
-    from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
-    ddconfig = dict(
-        double_z=False, z_channels=32, resolution=64, in_channels=3, out_ch=3,
-        ch=64, ch_mult=[1, 2, 2, 4], num_res_blocks=2,
-    )
-    hierarchy = dict(
-        mode="sqvae2", token_grid="native", tap_key_format="spatial",
-        sequence_length=13, latent_key="h8_w8",
-        blocks_sq="h8_w8_x1,h16_w16_x1,h32_w32_x1",
-        tap_channels=dict(h8_w8=32, h16_w16=128, h32_w32=128),
-    )
-    quantizer = dict(
-        type="sq", prior="zero", size_dict=[1536, 768, 384], dim_dict=[32, 32, 32],
-        log_param_q_init=[4.09434] * 3, temperature=dict(init=1.0, decay=1e-5, min=0.3),
-    )
-    vae = VideoHierVQModel(
-        ddconfig=ddconfig, hierarchy=hierarchy, quantizer=quantizer, learning_rate=1e-4,
-    )
+    from tests.predictor.stack_factory import smoke_vae_64
+
+    vae = smoke_vae_64()
     stage = PredictorStage(
         dim=32, n_heads=4, n_layers=1, codebook_size=384,
         h=32, w=32, max_t=13, max_shifts=4, has_parent=True,
@@ -71,16 +70,16 @@ def test_stg_05_codebook_match_vae():
 
 def test_stg_01_shift_0_init():
     stage, sched = _stage(0)
-    ctx = torch.randn(1, 4 * 64, 32)
+    ctx = torch.randn(1, 3 * 16, 32)
     builder = PyramidMaskBuilder(sched)
     masks = ShiftMasks(self_attn=builder.build_self_attn_mask(0, -1, ctx.device))
-    out = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=4)
-    assert out.o1.shape == out.o2.shape == (1, 4 * 64, 32)
+    out = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=3)
+    assert out.o1.shape == out.o2.shape == (1, 3 * 16, 32)
 
 
 def test_stg_02_shift_1_uses_streams():
     stage, sched = _stage(2)
-    ctx = torch.randn(1, 9 * 1024, 32)
+    ctx = torch.randn(1, 9 * 256, 32)
     masks = _bot_masks(sched, t_len=9)
     out0 = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=9)
     out1 = stage.execute_shift(
@@ -91,7 +90,7 @@ def test_stg_02_shift_1_uses_streams():
 
 def test_stg_04_logits_shape():
     stage, sched = _stage(2)
-    ctx = torch.randn(1, 9 * 1024, 32)
+    ctx = torch.randn(1, 9 * 256, 32)
     masks = _bot_masks(sched, t_len=9)
     out = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=9)
     assert out.logits.shape[-1] == sched.stages[2].codebook_size
@@ -99,7 +98,7 @@ def test_stg_04_logits_shape():
 
 def test_stg_06_shift_embed_differs():
     stage, sched = _stage(2)
-    ctx = torch.randn(1, 9 * 1024, 32)
+    ctx = torch.randn(1, 9 * 256, 32)
     masks = _bot_masks(sched, t_len=9)
     out0 = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=9)
     out1 = stage.execute_shift(
@@ -111,7 +110,7 @@ def test_stg_06_shift_embed_differs():
 
 def test_stg_factorized_forward():
     stage, sched = _stage(2, attention_type="factorized")
-    ctx = torch.randn(1, 9 * 1024, 32)
+    ctx = torch.randn(1, 9 * 256, 32)
     masks = _bot_masks(sched, t_len=9)
     out = stage.execute_shift(0, context_embed=ctx, stream_state=None, parent=None, masks=masks, t_len=9)
     assert torch.isfinite(out.logits).all()

@@ -13,6 +13,7 @@ def build_layer_quantizer(
     usage_reg_weight: float = 0.0,
     usage_reg_target_perplexity: float = 0.0,
     in_channels: int | None = None,
+    temporal_kl_weight: float = 0.0,
     **_,
 ) -> nn.Module:
     qtype = qtype.lower()
@@ -27,4 +28,5 @@ def build_layer_quantizer(
         usage_reg_weight=usage_reg_weight,
         usage_reg_target_perplexity=usage_reg_target_perplexity,
         in_channels=in_channels,
+        temporal_kl_weight=temporal_kl_weight,
     )

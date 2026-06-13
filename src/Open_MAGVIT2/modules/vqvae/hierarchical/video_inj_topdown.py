@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+﻿from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -316,8 +316,19 @@ class SQVAE2TopDown(nn.Module):
             self.num_layers,
             "usage_reg_target_perplexity",
         )
+        temporal_kl_weights = _expand_scalar_or_list(
+            quantizer_cfg.get("temporal_kl_weight", 0.0),
+            self.num_layers,
+            "temporal_kl_weight",
+        )
         lfq_sample = quantizer_cfg.get("sample_minimization_weight", 1.0)
         lfq_batch = quantizer_cfg.get("batch_maximization_weight", 1.0)
+        # Optional ceiling on log posterior variance. With prior "zero" a layer
+        # whose reconstruction gradient is weak can inflate its variance
+        # without bound (flatter posterior lowers both KL terms) — observed on
+        # the native lite config, layer 3: var 60 -> 119 in 8k steps.
+        lpq_max = quantizer_cfg.get("log_param_q_max")
+        self.log_param_q_max = float(lpq_max) if lpq_max is not None else None
         log_init = quantizer_cfg.get("log_param_q_init", [4.09434] * self.num_layers)
         if len(log_init) == 1:
             log_init = log_init * self.num_layers
@@ -369,6 +380,7 @@ class SQVAE2TopDown(nn.Module):
                 usage_reg_weight=usage_reg_weights[i],
                 usage_reg_target_perplexity=usage_reg_targets[i],
                 in_channels=z_channels,
+                temporal_kl_weight=temporal_kl_weights[i],
             )
             if self.use_learned_prior and qtypes[i] == "sq":
                 # Conditioning tensors use act_proj → z_channels (see _compute_prior_fields).
@@ -413,6 +425,12 @@ class SQVAE2TopDown(nn.Module):
     def set_temperature(self, tau: float) -> None:
         for block in self.blocks:
             block.quantizer.set_temperature(tau)
+
+    def _var_q_slice(self, idx_start: int, i: int) -> torch.Tensor:
+        lp = self.log_param_q_scalar[idx_start : i + 1]
+        if self.log_param_q_max is not None:
+            lp = lp.clamp(max=self.log_param_q_max)
+        return lp.exp()
 
     def _get_activation(
         self,
@@ -498,7 +516,7 @@ class SQVAE2TopDown(nn.Module):
         for i, res_key in enumerate(self.resolution_keys):
             if i == 0 or self.layer_upsample[i]:
                 idx_start = i
-            var_q = self.log_param_q_scalar[idx_start : i + 1].exp()
+            var_q = self._var_q_slice(idx_start, i)
             act = self._get_activation(activations, res_key)
             block = self.blocks[i]
             grid_shape = act.shape[2:]
@@ -576,7 +594,7 @@ class SQVAE2TopDown(nn.Module):
         for i, res_key in enumerate(self.resolution_keys):
             if i == 0 or self.layer_upsample[i]:
                 idx_start = i
-            var_q = self.log_param_q_scalar[idx_start : i + 1].exp()
+            var_q = self._var_q_slice(idx_start, i)
             act = self._get_activation(activations, res_key)
             block = self.blocks[i]
 

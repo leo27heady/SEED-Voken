@@ -39,7 +39,7 @@ def test_gld_02_e2e_loss_tolerance():
     vae, prep, orch, stages = orch_stack()
     vae.eval()
     stages.eval()
-    video = torch.randn(1, 3, 13, 64, 64)
+    video = torch.randn(1, 3, 9, 32, 32)  # orch_stack is lite 32px geometry
     with torch.no_grad():
         batch = prep.encode_and_schedule(vae, video, stages)
         a = orch.forward_train(batch)
