@@ -4,9 +4,15 @@
 
 This repository is scoped to **Path C**: causal hierarchical **SQ-VAE-2** tokenizers on synthetic shape video, plus an **envelope hierarchical predictor** on a frozen VAE.
 
+This repo now also supports an **FSQ** tokenizer (Path 2) — straight-through hard
+rounding, no learned codebook, no collapse, train == eval — as a collapse-free
+alternative to SQ-VAE-2, plus **progressive coding** + a **causal temporal-align**
+fix for the pyramid. See the v2 plan below.
+
 **Primary docs:**
 
-- [docs/PROJECT_MEMORY.md](./docs/PROJECT_MEMORY.md) — **living context: all findings, decisions, run history, next steps — read first**
+- [docs/PROJECT_MEMORY.md](./docs/PROJECT_MEMORY.md) — **living context: all findings, decisions, run history, next steps — read first** (see §0 for the v2 FSQ work)
+- [docs/PLAN_V2_FSQ_PREDICTOR.md](./docs/PLAN_V2_FSQ_PREDICTOR.md) — **implementation-ready master: FSQ (Path 2) + predictor modernization (Path 3), sequencing, gates, risks**
 - [docs/PATH_C_README.md](./docs/PATH_C_README.md) — training playbook (VAE → predictor)
 - [docs/PATH_C_AUDIT.md](./docs/PATH_C_AUDIT.md) — architecture audit & test status
 - [docs/Open-MAGVIT2-hierarchical-vq.md](./docs/Open-MAGVIT2-hierarchical-vq.md) — SQ-VAE-2 tokenizer details
@@ -47,6 +53,11 @@ configs/Open-MAGVIT2/gpu/
   shapes3d_sqvae2_32_S_lite_pyr_smoke.yaml # 2-epoch CPU smoke for the pyramid path
   shapes3d_sqvae2_32_S_lite_pyr_predict.yaml # predictor on the gated Run-2 ckpt
 
+  # v2 — FSQ tokenizer (collapse-free; train == eval) + progressive + causal align
+  shapes3d_fsq_32_S_lite_pyr.yaml            # FSQ match-K (4096/2048/1024), progressive_coding
+  shapes3d_fsq_32_S_lite_pyr_rightsized.yaml # FSQ rebalanced to observed usage (coarse↓, fine↓)
+  shapes3d_fsq_32_S_lite_pyr_smoke.yaml      # CPU smoke (tiny levels, CSV logger)
+
   # legacy baselines (pre-ELBO-fix; kept for comparison)
   shapes3d_sqvae2_32_S_lite.yaml           # 32px fast dev (review baseline)
   shapes3d_sqvae2_32_S_lite_predict.yaml
@@ -62,6 +73,10 @@ python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_32_S_lite_e
 
 # Run 2 — temporal pyramid + finest-state decoding (includes ELBO fix)
 python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_32_S_lite_pyr.yaml
+
+# v2 — FSQ tokenizer (progressive + causal temporal align). G1 is informational for
+# FSQ (uniform usage by construction); G2/G3/G4 are the binding gates.
+python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_fsq_32_S_lite_pyr.yaml
 
 # Gate a checkpoint (exit 0 = all gates pass)
 python scripts/token_quality_report.py `

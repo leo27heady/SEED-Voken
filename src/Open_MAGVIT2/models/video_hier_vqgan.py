@@ -362,7 +362,16 @@ class VideoHierVQModel(L.LightningModule):
             self._last_numerical_report = get_numerical_report()
         return x_rec, layer_results
 
-    def decode_progressive(self, x, flg_quant_det=True, flg_train=False):
+    def decode_progressive(self, x, flg_quant_det=True, flg_train=False, clamp=True):
+        """Decode each progressive partial state.
+
+        clamp=True (default) is for VISUALIZATION (log_images). For the TRAINING
+        loss pass clamp=False: the progressive distortion must be on the RAW decoder
+        output so the model is penalized for outputs outside [-1, 1] — exactly like
+        the non-progressive path (which uses the unclamped forward x_rec). Clamping
+        in the loss made the decoder free to overshoot the range, inflating the
+        (unclamped) val_ema/mse metric ~800x while the clamped visuals looked clean.
+        """
         if self.hierarchy_mode == "sqvae2":
             h, activations = self.encoder(x, return_intermediates=True)
             _, partial_z = self.hier_quant.forward_progressive(
@@ -376,7 +385,9 @@ class VideoHierVQModel(L.LightningModule):
             _, partial_z = self.hier_quant.forward_progressive(
                 h, flg_quant_det=flg_quant_det, flg_train=flg_train
             )
-        return [self.decode(z).clamp(-1, 1) for z in partial_z]
+        if clamp:
+            return [self.decode(z).clamp(-1, 1) for z in partial_z]
+        return [self.decode(z) for z in partial_z]
 
     def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
@@ -385,7 +396,11 @@ class VideoHierVQModel(L.LightningModule):
 
         progressive_recs = None
         if self.progressive_coding:
-            progressive_recs = self.decode_progressive(x, flg_quant_det=False, flg_train=True)
+            # clamp=False: penalize out-of-range outputs (consistent with the
+            # unclamped non-progressive distortion and the val metric).
+            progressive_recs = self.decode_progressive(
+                x, flg_quant_det=False, flg_train=True, clamp=False
+            )
 
         if self.sche_type is not None and self.resume_lr is None:
             g_it = self.trainer.global_step

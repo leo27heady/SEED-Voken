@@ -1,0 +1,129 @@
+# FSQ pyramid CPU smoke — tiny levels/dataset/epochs to sanity-check the full
+# train pipeline (data + trainer + progressive + FSQ + causal align + ELBO loss)
+# without a GPU or W&B. Builds a small local shape cache on first run.
+#   python main.py fit --config configs/Open-MAGVIT2/gpu/shapes3d_fsq_32_S_lite_pyr_smoke.yaml
+seed_everything: 1234
+trainer:
+  accelerator: cpu
+  devices: 1
+  precision: 32
+  max_epochs: 2
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  log_every_n_steps: 5
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_fsq_32_S_lite_pyr_smoke
+  callbacks:
+    - class_path: src.Open_MAGVIT2.callbacks.nan_guard.NanGuardCallback
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: ../../results/vqgan/
+      name: fsq_smoke
+
+model:
+  class_path: src.Open_MAGVIT2.models.video_hier_vqgan.VideoHierVQModel
+  init_args:
+    progressive_coding: true
+    ddconfig:
+      double_z: False
+      z_channels: 16
+      resolution: 32
+      in_channels: 3
+      out_ch: 3
+      ch: 32
+      ch_mult: [1, 2, 2, 4]
+      num_res_blocks: 1
+      num_groups: 8
+    dec_ddconfig:
+      double_z: False
+      z_channels: 16
+      resolution: 32
+      in_channels: 3
+      out_ch: 3
+      ch: 32
+      ch_mult: [1, 2]
+      num_res_blocks: 1
+      num_groups: 8
+    hierarchy:
+      mode: sqvae2
+      token_grid: pyramid
+      tap_key_format: spatial
+      sequence_length: 9
+      latent_key: h4_w4
+      blocks_sq: "h4_w4_x1,h8_w8_u2,h16_w16_u2"
+      temporal_up: [2, 2]
+      decoder_source: finest_state
+      temporal_align_mode: causal
+      tap_channels:
+        h4_w4: 16
+        h8_w8: 64
+        h16_w16: 64
+    quantizer:
+      type: fsq
+      levels: [[4, 4, 4], [4, 4, 4], [4, 4, 4]]   # tiny K=64 each for speed
+    loss_cfg:
+      kl_beta: 1.0
+      grad_clip: 1.0
+    learning_rate: 1.0e-4
+    numerical_debug: false
+    training_objective: hq_elbo
+    use_gan: false
+    use_ema: true
+    top_down_width: 16
+    scheduler_type: "None"
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 2
+    num_workers: 0
+    train:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: train
+          sequence_length: 9
+          dataset_size: 32
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    validation:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: validation
+          sequence_length: 9
+          dataset_size: 8
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    test:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: test
+          sequence_length: 9
+          dataset_size: 8
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+
+ckpt_path: null

@@ -8,6 +8,85 @@
 > [PATH_C_AUDIT.md](./PATH_C_AUDIT.md) (audit + 2026-06 corrections addendum),
 > [wandb_analysis/baseline_lite_2026-06-11.md](./wandb_analysis/baseline_lite_2026-06-11.md) (frozen baseline numbers),
 > [wandb_analysis/elbofix_run1_health_2026-06-12.md](./wandb_analysis/elbofix_run1_health_2026-06-12.md) (Run-1 verdict).
+>
+> **v2 work (2026-06-13/14) is summarized in §0 below and detailed in
+> [PLAN_V2_FSQ_PREDICTOR.md](./PLAN_V2_FSQ_PREDICTOR.md)** (the implementation-ready
+> master for FSQ + predictor modernization).
+
+---
+
+## 0. v2 update — FSQ tokenizer + fixes (2026-06-13/14)
+
+Chronology since §1–9 below (which end at the SQ Path-A work):
+
+1. **Run 1 elbofix to plateau** (`cwisgodl`): ELBO mechanics confirmed live (self-annealing
+   var L1 60→0.93, L2 60→4.1; L3 dead at the clamp = structural, expected). Gate FAIL by
+   design (native topology) — the attribution baseline.
+2. **Run 2 pyramid + finest_state** (`jijbhzdi`): revived L3 (var→2.9, codes→708) but
+   **starved coarse/mid** (var stuck ~51, ~15-20 codes) — the mirror of native
+   mid-dominance. Recon great, hierarchy cosmetic. See
+   [[finding-pyramid-layer-starvation]].
+3. **Run 2c + `progressive_coding: true`** (`lle1hzce`): **starvation FIXED** — all 3 layers
+   anneal + fill codebooks; clean coarse→fine progressive MSE. Surfaced a **clamp bug**
+   (next item).
+4. **CLAMP BUG (found + fixed 2026-06-14).** `decode_progressive` clamped each partial to
+   [-1,1] and, with `progressive_coding`, the **training loss used the clamped recon** →
+   the decoder freely overshot [-1,1] (free in background) while the **unclamped val
+   metric exploded ~800×** (val_ema 0.135/0.18 while clamped visuals + the gate were
+   ~0.0003). NOT EMA lag / NOT overfit (proven: forward raw 0.182 vs clamped 0.000294 on
+   the same ckpt; current≈EMA, train≈val). This also corrected the earlier (wrong)
+   "soft/hard gap" diagnosis of Run 2c — FSQ has no soft/hard gap yet showed the same
+   inflation, so the clamp was the dominant cause. **Fix:** `decode_progressive(clamp=…)`,
+   default True (viz); `training_step` passes `clamp=False` so the progressive distortion
+   is on raw recon (consistent with the non-progressive path + val). `val_ema/mse` is the
+   ES+ModelCheckpoint monitor, so the bug corrupted ckpt selection → rerun after the fix.
+   Regression test `test_progressive_loss_target_matches_val_target_unclamped`.
+5. **FSQ quantizer implemented (Path 2).** `modules/vqvae/hierarchical/fsq.py`
+   (`FSQLayerQuantizer`): straight-through hard rounding ⇒ **train == eval** (no soft/hard
+   gap), `aux_loss=0`, no temperature/prior/posterior_var, ~uniform usage by construction.
+   Official Mentzer math with the even-level offset (naive `(L-1)/2` rounding drops a code
+   for even L). Dispatch in `quantizer_builder.py`; `levels` plumbed through
+   `video_inj_topdown.py` (per-fsq-layer validation). `decoder_source: finest_state` +
+   `progressive_coding` compose with FSQ unchanged. Configs `shapes3d_fsq_32_S_lite_pyr*`.
+   Tests `test_fsq_quantizer.py`, `test_fsq_topdown.py`.
+6. **Temporal-align fix (verified t=1 artifact).** Progressive partials were trilinearly
+   upsampled (uniform) which is inconsistent with the causal (non-uniform) encoder
+   downsampling: output frame 1 mapped onto coarse frame 0 (causal-boundary frame) →
+   stale/fuzzy L1-only t=1 (decoded t1 MSE 8.7× t0 despite identical latent). Fix:
+   `hierarchy.temporal_align_mode: causal` replays the learned Upsampler chain
+   (`_upsample_state_to_finest`). Default `trilinear` (back-compat). FULL recon + the gate
+   path (`decode_from_indices`) were already correct (learned upsampler) — fix is
+   progressive-viz/loss only. Test `test_progressive_temporal_align.py`.
+7. **FSQ runs.** `2a4x834p` (match-K, pre-clamp-fix: val_ema 0.18 artifact, recon actually
+   0.0003). `bllr9fzo` (match-K, **post-clamp-fix**): val_ema honest 0.00087→**0.00019**
+   (best of any run), stable (distortion CV 0.05), clean progressive decomposition
+   (L1-only 0.0061 → +L2 0.0013 → full 0.00021, i.e. 29.5×/6.5× — meaningful hierarchy).
+
+**FSQ metric semantics (so the logs read correctly):** kl_total=0. **Perplexity INCREASES**
+over training (encoder learns to spread hard codes) — opposite of SQ's start-high-decrease.
+Per-batch perplexity is **position-capped**: L1 has only bs·48 = 768 positions/batch < K=4096,
+so L1 ppl/K caps at 0.19 regardless of quality (a measurement artifact; the gate over 128
+videos = more positions is the truer number). **G1 (ppl/K) is INFORMATIONAL for FSQ**
+(uniform by construction); **G2/G3/G4 are the binding signal** (note printed by the gate).
+
+**Codebook usage (bllr9fzo) and right-sizing.** Active codes: L1 674/4096 (oversized; also
+position-capped), L2 1576/2048 (well-matched, the workhorse), L3 367/1024 (under-used,
+simple residual). So the data wants **mid ≥ coarse ≥ fine** in codebook size, NOT
+coarse>mid>fine. Right-size to observed usage + headroom: coarse ~1024, mid 2048, fine ~512
+(`shapes3d_fsq_32_S_lite_pyr_rightsized.yaml`). NB the earlier fine-heavy right-sized levels
+(fine 12800) were a low-d "recon insurance" hypothesis that the data did not support (recon
+already 0.0002). Codebook size is set by FSQ `levels` (a list = per-channel level counts; K
+= ∏levels = the implicit grid; more list entries = more channels/finer per-position
+resolution). The right balance is data-dependent: simple shapes ⇒ small fine; natural video
+with rich texture ⇒ larger fine.
+
+**Status / next:** `bllr9fzo` is gate-ready (recon 0.00019, balanced, honest metrics). The
+tokenizer codebook right-sizing is an **optional ablation, not a blocker** — an oversized
+coarse codebook wastes capacity but doesn't break anything, and the pre-tokenized-index
+interface lets a better tokenizer be swapped in later without redoing predictor work. The
+dissertation contribution + the open problem (val_ce_ar AR divergence) are in **Path 3
+(predictor)**. Recommended: gate `bllr9fzo` → freeze → start Path 3; run one corrected
+right-sized tokenizer in parallel as the size ablation if desired.
 
 ---
 

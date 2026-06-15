@@ -279,6 +279,21 @@ class SQVAE2TopDown(nn.Module):
                 "(token_grid: pyramid) so a z_state pyramid exists"
             )
 
+        # How progressive partials are lifted to the finest grid for single-decoder
+        # rendering. 'trilinear' (legacy) uses uniform interpolation, which is
+        # inconsistent with the causal (non-uniform) encoder downsampling and puts
+        # coarse frame 0 on output frames 0 AND 1 -> the t=1 fuzzy artifact.
+        # 'causal' replays the learned Upsampler chain instead (see
+        # docs/PLAN_V2_FSQ_PREDICTOR.md S1). Only affects forward_progressive.
+        self.temporal_align_mode = str(
+            hierarchy_cfg.get("temporal_align_mode", "trilinear")
+        ).lower()
+        if self.temporal_align_mode not in ("trilinear", "causal"):
+            raise ValueError(
+                f"hierarchy.temporal_align_mode must be 'trilinear' or 'causal', "
+                f"got {self.temporal_align_mode!r}"
+            )
+
         latent_key = hierarchy_cfg.get("latent_key")
         if latent_key is None:
             latent_key = self.resolution_keys[0]
@@ -297,6 +312,28 @@ class SQVAE2TopDown(nn.Module):
             size_dict = size_dict * self.num_layers
         if len(dim_dict) == 1:
             dim_dict = dim_dict * self.num_layers
+
+        # FSQ per-layer levels (list-of-lists). Required for fsq layers, mapped by
+        # layer index; non-fsq layers get None. Validates against the number of
+        # fsq layers (not num_layers) so a mixed per_layer config is well-formed.
+        levels_cfg = quantizer_cfg.get("levels")
+        fsq_layer_indices = [i for i, q in enumerate(qtypes) if str(q).lower() == "fsq"]
+        if levels_cfg is not None:
+            levels_cfg = list(levels_cfg)
+            if len(levels_cfg) == 1:
+                levels_cfg = levels_cfg * len(fsq_layer_indices)
+            if len(levels_cfg) != len(fsq_layer_indices):
+                raise ValueError(
+                    f"quantizer.levels length {len(levels_cfg)} != number of fsq "
+                    f"layers {len(fsq_layer_indices)}"
+                )
+            self._levels_map = {
+                idx: list(levels_cfg[j]) for j, idx in enumerate(fsq_layer_indices)
+            }
+        else:
+            if fsq_layer_indices:
+                raise ValueError("fsq quantizer layers require quantizer.levels")
+            self._levels_map = {}
 
         temp_init = quantizer_cfg.get("temperature", {}).get("init", 1.0)
         prior_cfg = quantizer_cfg.get("prior", "zero")
@@ -381,6 +418,7 @@ class SQVAE2TopDown(nn.Module):
                 usage_reg_target_perplexity=usage_reg_targets[i],
                 in_channels=z_channels,
                 temporal_kl_weight=temporal_kl_weights[i],
+                levels=self._levels_map.get(i),
             )
             if self.use_learned_prior and qtypes[i] == "sq":
                 # Conditioning tensors use act_proj → z_channels (see _compute_prior_fields).
@@ -431,6 +469,26 @@ class SQVAE2TopDown(nn.Module):
         if self.log_param_q_max is not None:
             lp = lp.clamp(max=self.log_param_q_max)
         return lp.exp()
+
+    def _upsample_state_to_finest(
+        self, z_state: torch.Tensor, from_layer: int
+    ) -> torch.Tensor:
+        """Replay the learned u2 Upsamplers of blocks (from_layer, num_layers) on a
+        partial z_state so it lands on the finest grid with the SAME causal temporal
+        map (depth_to_space + frame-drop, T -> 2T-1) the forward chain used — NOT
+        uniform trilinear. Identity when from_layer is the last block.
+
+        Used by forward_progressive under temporal_align_mode='causal' to remove the
+        t=1 artifact: trilinear maps output frame 1 onto coarse frame 0 (the causal-
+        boundary frame whose encoder RF is input frame 0 only), so the coarse partial
+        showed stale frame-0 content at t=1. See docs/PLAN_V2_FSQ_PREDICTOR.md S1.
+        """
+        z = z_state
+        for j in range(from_layer + 1, self.num_layers):
+            block = self.blocks[j]
+            if isinstance(block, InjSQBlock):
+                z = block.spatial_up(z)
+        return z
 
     def _get_activation(
         self,
@@ -635,9 +693,18 @@ class SQVAE2TopDown(nn.Module):
 
         if self.decoder_source == "finest_state":
             # Align intermediate-state partials to the finest grid so a single
-            # decoder can render every progressive stage.
+            # decoder can render every progressive stage. 'causal' replays the
+            # learned Upsampler chain (matches the forward temporal map; fixes the
+            # t=1 trilinear artifact); 'trilinear' is the legacy uniform interp.
             finest_thw = partial[-1].shape[2:]
-            partial = [align_spatial(p, finest_thw) for p in partial]
+            if self.temporal_align_mode == "causal":
+                partial = [
+                    p if tuple(p.shape[2:]) == tuple(finest_thw)
+                    else self._upsample_state_to_finest(p, from_layer=i)
+                    for i, p in enumerate(partial)
+                ]
+            else:
+                partial = [align_spatial(p, finest_thw) for p in partial]
             return partial[-1], partial
         return z_latent, partial
 

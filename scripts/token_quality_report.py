@@ -156,6 +156,14 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[info] device={device}")
     model, cfg = load_model(args.config, args.ckpt, device)
+    qtype = str(
+        cfg["model"]["init_args"].get("quantizer", {}).get("type", "sq")
+    ).lower()
+    if qtype in ("fsq", "lfq"):
+        print(
+            f"[note] quantizer={qtype}: G1 (perplexity/K) is INFORMATIONAL — usage is "
+            "~uniform by construction; G2/G3/G4 are the binding signal."
+        )
     data_cfg = cfg["data"]["init_args"]["validation"]["params"]["config"]
     ds = ShapeVideoDataset(config=data_cfg)
     n_videos = min(args.n_videos, len(ds))
