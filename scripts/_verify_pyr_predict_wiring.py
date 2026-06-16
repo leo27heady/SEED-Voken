@@ -36,7 +36,7 @@ proj_grads = [
 print("codebook_proj grads alive:", proj_grads)
 fine = model.predictor_stages[2]
 qk = sum(p.grad.abs().sum().item() for n, p in fine.named_parameters()
-         if ("cross_q" in n or "cross_k" in n) and p.grad is not None)
+         if "cross" in n and (".q." in n or ".k." in n) and p.grad is not None)
 print("fine cross q/k grad_abs_sum:", round(qk, 6), "(must be > 0 with cross_spatial_window=1)")
 print("AR forward:", end=" ")
 with torch.no_grad():

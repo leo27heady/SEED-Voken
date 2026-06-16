@@ -10,9 +10,17 @@ predictor work:
 
 Gates (see docs/wandb_analysis/baseline_lite_2026-06-11.md for the baseline):
   G1 perplexity / K            >= --min-perplexity-frac   for every layer
-  G2 token persistence         coarse > mid > fine AND coarse >= --min-coarse-persistence
-  G3 ablation delta-MSE order  coarse >= mid >= fine
   G4 recon MSE (per pixel)     <= --max-recon-mse
+
+  G2/G3 are quantizer-aware (collapse-free FSQ/LFQ vs SQ):
+    SQ  — G2 token persistence   coarse > mid > fine AND coarse >= --min-coarse-persistence
+          G3 ablation dMSE order  coarse >= mid >= fine
+    FSQ/LFQ — exact-match persistence is ~0 for high-entropy codes on moving data
+          (the script already prefers temporal MI), and mid-dominant ablation is the
+          documented data preference for this pyramid, NOT the down-fusion bug G3 was
+          built for. So the binding signals become:
+          G2 temporal-MI hierarchy  coarse >= mid >= fine (within --mi-tol)
+          G3 no dead layer          every layer ablation dMSE >= --min-ablation-dmse
 
 Exit code 0 = all gates pass, 1 = at least one fails, 2 = error.
 """
@@ -41,6 +49,11 @@ def parse_args():
     p.add_argument("--json", default=None, help="write metrics to this JSON file")
     p.add_argument("--min-perplexity-frac", type=float, default=0.10)
     p.add_argument("--min-coarse-persistence", type=float, default=0.5)
+    # FSQ/LFQ binding-gate knobs (see module docstring):
+    p.add_argument("--min-ablation-dmse", type=float, default=0.002,
+                   help="FSQ/LFQ G3 dead-layer floor: min ablation dMSE per layer")
+    p.add_argument("--mi-tol", type=float, default=0.0,
+                   help="FSQ/LFQ G2 tolerance on the non-increasing temporal-MI hierarchy")
     # 0.0028 was the KL-free baseline AE's distortion; a properly KL-regularized
     # ELBO model sits at a different rate-distortion point. 0.005 keeps shapes
     # clearly recognizable while leaving room for real KL pressure.
@@ -159,10 +172,16 @@ def main():
     qtype = str(
         cfg["model"]["init_args"].get("quantizer", {}).get("type", "sq")
     ).lower()
-    if qtype in ("fsq", "lfq"):
+    is_collapse_free = qtype in ("fsq", "lfq")
+    if is_collapse_free:
         print(
-            f"[note] quantizer={qtype}: G1 (perplexity/K) is INFORMATIONAL — usage is "
-            "~uniform by construction; G2/G3/G4 are the binding signal."
+            f"[note] quantizer={qtype}: collapse-free family. G1 (perplexity/K) is "
+            "informational (~uniform by construction). G2 uses the temporal-MI "
+            "hierarchy (coarse>=mid>=fine) instead of exact-match persistence; G3 "
+            "checks for a DEAD layer instead of a coarse>=mid>=fine ablation order "
+            "(mid-dominant recon is the data's preference for this pyramid). "
+            "Raw persistence + ablation order are still printed below as diagnostics. "
+            "G4 recon is the headline."
         )
     data_cfg = cfg["data"]["init_args"]["validation"]["params"]["config"]
     ds = ShapeVideoDataset(config=data_cfg)
@@ -194,11 +213,21 @@ def main():
         stats[s]["perplexity_frac"] >= args.min_perplexity_frac for s in range(S)
     )
     pers = [stats[s]["persistence"] for s in range(S)]
-    gates["G2_persistence"] = (
-        all(pers[i] > pers[i + 1] for i in range(S - 1))
-        and pers[0] >= args.min_coarse_persistence
-    )
-    gates["G3_ablation_order"] = all(deltas[i] >= deltas[i + 1] for i in range(S - 1))
+    mi = [stats[s]["temporal_mi_nats"] for s in range(S)]
+    if is_collapse_free:
+        # robust replacements (see docstring + the [note] above)
+        gates["G2_temporal_coherence"] = all(
+            mi[i] >= mi[i + 1] - args.mi_tol for i in range(S - 1)
+        )
+        gates["G3_no_dead_layer"] = all(
+            deltas[s] >= args.min_ablation_dmse for s in range(S)
+        )
+    else:
+        gates["G2_persistence"] = (
+            all(pers[i] > pers[i + 1] for i in range(S - 1))
+            and pers[0] >= args.min_coarse_persistence
+        )
+        gates["G3_ablation_order"] = all(deltas[i] >= deltas[i + 1] for i in range(S - 1))
     gates["G4_recon_mse"] = base_mse <= args.max_recon_mse
 
     print("\n## Gates\n")

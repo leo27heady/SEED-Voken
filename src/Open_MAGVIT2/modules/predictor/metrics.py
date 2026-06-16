@@ -49,8 +49,11 @@ def token_accuracy_from_output(
     out: PredictorOutput,
     batch,
     schedule: PyramidSchedule,
+    stages,
 ) -> Dict[int, torch.Tensor]:
-    """Per-stage mean top-1 accuracy over shifts at query positions."""
+    """Per-stage mean composite-index top-1 accuracy over shifts at query
+    positions. Uses the stage's commit (per-channel compose for factorized FSQ),
+    so it is correct for both output modes."""
     correct: Dict[int, list] = {}
     total: Dict[int, list] = {}
     for s, k in schedule.envelope_order():
@@ -60,7 +63,7 @@ def token_accuracy_from_output(
         sup = batch.supervision[s][k]
         tgt = batch.target_indices[s][k]
         q_logits = logits[:, sup.query_positions]
-        pred = q_logits.argmax(dim=-1).reshape(-1)
+        pred = stages[s].commit_index(q_logits).reshape(-1)
         tgt_flat = tgt.reshape(-1)
         n = tgt_flat.numel()
         correct.setdefault(s, []).append((pred == tgt_flat).float().sum())
@@ -69,6 +72,29 @@ def token_accuracy_from_output(
         s: torch.stack(correct[s]).sum() / torch.stack(total[s]).sum().clamp(min=1)
         for s in correct
     }
+
+
+def per_channel_accuracy_from_output(
+    out: PredictorOutput,
+    batch,
+    schedule: PyramidSchedule,
+    stages,
+) -> Dict[int, torch.Tensor]:
+    """Factorized-FSQ stages only: per-stage mean per-channel top-1 accuracy
+    (the honest learning signal — composite top-1 stays ~product-low)."""
+    accs: Dict[int, list] = {}
+    for s, k in schedule.envelope_order():
+        if getattr(stages[s], "output_mode", "composite") != "factorized_fsq":
+            continue
+        logits = out.logits.get((s, k))
+        if logits is None:
+            continue
+        sup = batch.supervision[s][k]
+        q_logits = logits[:, sup.query_positions]
+        a = stages[s].mean_per_channel_accuracy(q_logits, batch.target_indices[s][k])
+        if a is not None:
+            accs.setdefault(s, []).append(a)
+    return {s: torch.stack(v).mean() for s, v in accs.items()}
 
 
 def build_train_log_dict(
@@ -95,8 +121,14 @@ def build_train_log_dict(
         for (s, k), ce in out.ce_breakdown.items():
             log[f"train/ce_s{s}_k{k}"] = ce
 
-    for s, acc in token_accuracy_from_output(out, batch, model.schedule).items():
+    for s, acc in token_accuracy_from_output(
+        out, batch, model.schedule, model.predictor_stages
+    ).items():
         log[f"train/token_acc_stage_{s}"] = acc.detach()
+    for s, acc in per_channel_accuracy_from_output(
+        out, batch, model.schedule, model.predictor_stages
+    ).items():
+        log[f"train/token_acc_pc_stage_{s}"] = acc.detach()
 
     if model.trainer is not None and model.trainer.optimizers:
         opt = model.optimizers()
@@ -129,8 +161,14 @@ def build_val_log_dict(
         for (s, k), ce in out_ar.ce_breakdown.items():
             log[f"val/ce_s{s}_k{k}"] = ce
 
-    for s, acc in token_accuracy_from_output(out_ar, batch, model.schedule).items():
+    for s, acc in token_accuracy_from_output(
+        out_ar, batch, model.schedule, model.predictor_stages
+    ).items():
         log[f"val/token_acc_ar_stage_{s}"] = acc.detach()
+    for s, acc in per_channel_accuracy_from_output(
+        out_ar, batch, model.schedule, model.predictor_stages
+    ).items():
+        log[f"val/token_acc_pc_ar_stage_{s}"] = acc.detach()
 
     if parallel_skipped:
         log["val/parallel_skipped"] = torch.tensor(1.0)
@@ -156,7 +194,9 @@ def build_val_log_dict(
             for (s, k), ce in out_par.ce_breakdown.items():
                 log[f"val_parallel/ce_s{s}_k{k}"] = ce
                 log[f"val_tf/ce_s{s}_k{k}"] = ce
-        for s, acc in token_accuracy_from_output(out_par, batch, model.schedule).items():
+        for s, acc in token_accuracy_from_output(
+            out_par, batch, model.schedule, model.predictor_stages
+        ).items():
             log[f"val/token_acc_parallel_stage_{s}"] = acc.detach()
             log[f"val/token_acc_tf_stage_{s}"] = acc.detach()
 

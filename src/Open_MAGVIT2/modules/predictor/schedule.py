@@ -112,6 +112,20 @@ class PyramidSchedule:
         visit(0, 0)
         return order
 
+    def envelope_shifts(self) -> List["Shift"]:
+        """`envelope_order()` lifted to `Shift` value objects (parent pointer filled).
+
+        Byte-identical traversal to `envelope_order()` (`as_tuple()` round-trips);
+        the rollout layer consumes these instead of bare tuples (PLAN_V2 §5.2)."""
+        from src.Open_MAGVIT2.modules.predictor.shift import Shift
+
+        shifts: List[Shift] = []
+        for s, k in self.envelope_order():
+            parent = self.parent_for(s, k)
+            ps, pk = parent if parent is not None else (None, None)
+            shifts.append(Shift(stage=s, k=k, parent_stage=ps, parent_k=pk))
+        return shifts
+
     def parent_for(self, stage_idx: int, shift_idx: int) -> Optional[Tuple[int, int]]:
         if stage_idx == 0:
             return None

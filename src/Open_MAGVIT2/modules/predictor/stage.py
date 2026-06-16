@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.Open_MAGVIT2.modules.predictor.attention.factorized_layer import FactorizedPredictorLayer
 from src.Open_MAGVIT2.modules.predictor.parent_condition import ParentCondition
@@ -43,6 +44,8 @@ class PredictorStage(nn.Module):
         t_window: int = -1,
         spatial_window: int | None = None,
         use_reversible_backprop: bool = False,
+        output_mode: str = "composite",
+        levels: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -89,8 +92,35 @@ class PredictorStage(nn.Module):
                 )
                 for _ in range(n_layers)
             ])
+        # Output head: a single K-way softmax over the composite index ("composite"),
+        # or per-FSQ-channel softmaxes ("factorized_fsq"). Factorized matches FSQ's
+        # mixed-radix structure: it predicts each scalar channel (4-8 way) and gives
+        # partial credit, instead of one ~impossible 1-of-K composite classification.
+        self.output_mode = output_mode
+        if output_mode == "factorized_fsq":
+            if not levels:
+                raise ValueError("output_mode='factorized_fsq' requires per-stage FSQ 'levels'")
+            self.levels = [int(L) for L in levels]
+            prod = 1
+            for L in self.levels:
+                prod *= L
+            if prod != codebook_size:
+                raise ValueError(
+                    f"prod(levels)={prod} != codebook_size={codebook_size}"
+                )
+            # FSQ basis (mixed-radix): index = sum_i code_i * basis_i (matches fsq.py)
+            basis = torch.cumprod(torch.tensor([1] + self.levels[:-1], dtype=torch.long), dim=0)
+            self.register_buffer("_fsq_basis", basis, persistent=False)
+            head_out_dim = int(sum(self.levels))
+        elif output_mode == "composite":
+            self.levels = None
+            head_out_dim = codebook_size
+        else:
+            raise ValueError(f"unknown output_mode {output_mode!r}")
+        self.head_out_dim = head_out_dim
+
         self.stream_fusion = build_stream_fusion(stream_fusion_mode, dim)
-        self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, codebook_size))
+        self.output_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, head_out_dim))
         self.codebook_embed = nn.Embedding(codebook_size, self.codebook_dim)
         if self.codebook_dim == dim:
             self.codebook_proj = nn.Identity()
@@ -187,3 +217,64 @@ class PredictorStage(nn.Module):
         b, t, h, w = indices.shape
         flat = indices.reshape(b, t * h * w)
         return self.embed_token_ids(flat)
+
+    # ---- output-head semantics (composite vs factorized FSQ) ----------------
+    def shift_cross_entropy(
+        self, logits: torch.Tensor, target_index: torch.Tensor
+    ) -> torch.Tensor:
+        """CE for one shift's query positions. Composite: K-way CE. Factorized
+        FSQ: SUM of per-channel CEs (== composite-scale CE at uniform, so the
+        loss magnitude and ce_over_baseline stay comparable across modes)."""
+        flat = logits.reshape(-1, logits.shape[-1]).float()
+        tgt = target_index.reshape(-1)
+        if self.output_mode != "factorized_fsq":
+            return F.cross_entropy(flat, tgt)
+        total = flat.new_zeros(())
+        off = 0
+        for i, L in enumerate(self.levels):
+            code_i = (tgt // int(self._fsq_basis[i])) % L
+            total = total + F.cross_entropy(flat[:, off : off + L], code_i)
+            off += L
+        return total
+
+    def commit_index(self, logits: torch.Tensor, *, sample: bool = False) -> torch.Tensor:
+        """Argmax (or sample) -> composite index. Factorized: per-channel pick
+        then recompose via the FSQ basis (so the decoded value is per-channel
+        best, degrading gracefully instead of landing on a far composite cell)."""
+        lead = logits.shape[:-1]
+        flat = logits.reshape(-1, logits.shape[-1])
+        if self.output_mode != "factorized_fsq":
+            if sample:
+                idx = torch.multinomial(flat.softmax(dim=-1), 1).squeeze(-1)
+            else:
+                idx = flat.argmax(dim=-1)
+            return idx.reshape(lead)
+        idx = torch.zeros(flat.shape[0], dtype=torch.long, device=flat.device)
+        off = 0
+        for i, L in enumerate(self.levels):
+            ch = flat[:, off : off + L]
+            code_i = (
+                torch.multinomial(ch.softmax(dim=-1), 1).squeeze(-1)
+                if sample
+                else ch.argmax(dim=-1)
+            )
+            idx = idx + code_i * int(self._fsq_basis[i])
+            off += L
+        return idx.reshape(lead)
+
+    def mean_per_channel_accuracy(
+        self, logits: torch.Tensor, target_index: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Factorized only: mean over channels of per-channel top-1 accuracy
+        (the honest training-health signal; composite top-1 stays ~product-low)."""
+        if self.output_mode != "factorized_fsq":
+            return None
+        flat = logits.reshape(-1, logits.shape[-1])
+        tgt = target_index.reshape(-1)
+        accs = []
+        off = 0
+        for i, L in enumerate(self.levels):
+            code_i = (tgt // int(self._fsq_basis[i])) % L
+            accs.append((flat[:, off : off + L].argmax(dim=-1) == code_i).float().mean())
+            off += L
+        return torch.stack(accs).mean()

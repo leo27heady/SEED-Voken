@@ -7,9 +7,19 @@ import torch.nn as nn
 from torch.nn import MultiheadAttention as MHA
 
 from src.Open_MAGVIT2.modules.predictor.attention.utils import mha_self_attention
+from src.Open_MAGVIT2.modules.predictor.cross_conditioning import (
+    CrossConditioning,
+    remap_cross_state_dict,
+)
 
 
 class ParallelPredictorResidual(nn.Module):
+    # legacy checkpoint key -> unified submodule key (CrossConditioning, §5.5)
+    _CROSS_REMAP = {
+        "cross_attn_q": "cross.q", "cross_attn_k": "cross.k",
+        "cross_attn_v": "cross.v", "cross_attn": "cross.attn",
+    }
+
     def __init__(
         self,
         dim: int,
@@ -24,16 +34,19 @@ class ParallelPredictorResidual(nn.Module):
         self.self_attn = MHA(dim, n_heads, batch_first=True)
         if has_cross_attn:
             kv_dim = parent_dim if parent_dim is not None else dim
-            self.cross_attn_q = nn.Linear(dim, dim)
-            self.cross_attn_k = nn.Linear(kv_dim, dim)
-            self.cross_attn_v = nn.Linear(kv_dim, dim)
-            self.cross_attn = MHA(dim, n_heads, batch_first=True)
+            # q,k,v,attn order matches the old cross_attn_q/k/v/cross_attn order,
+            # keeping module-traversal (and so trunc_normal_) draws identical.
+            self.cross = CrossConditioning(dim, n_heads, kv_dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio),
             nn.GELU(),
             nn.Linear(dim * mlp_ratio, dim),
         )
         self._init_weights()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        remap_cross_state_dict(state_dict, prefix, self._CROSS_REMAP)
+        super()._load_from_state_dict(state_dict, prefix, *args)
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -47,9 +60,9 @@ class ParallelPredictorResidual(nn.Module):
         if self.self_attn.out_proj.bias is not None:
             nn.init.zeros_(self.self_attn.out_proj.bias)
         if self.has_cross_attn:
-            nn.init.zeros_(self.cross_attn.out_proj.weight)
-            if self.cross_attn.out_proj.bias is not None:
-                nn.init.zeros_(self.cross_attn.out_proj.bias)
+            nn.init.zeros_(self.cross.attn.out_proj.weight)
+            if self.cross.attn.out_proj.bias is not None:
+                nn.init.zeros_(self.cross.attn.out_proj.bias)
 
     def forward(
         self,
@@ -64,11 +77,6 @@ class ParallelPredictorResidual(nn.Module):
         sa_out = mha_self_attention(self.self_attn, y, attn_mask=sa_mask)
         delta = sa_out
         if self.has_cross_attn and cross_kv is not None:
-            q = self.cross_attn_q(y)
-            k = self.cross_attn_k(cross_kv)
-            v = self.cross_attn_v(cross_kv)
-            ca_mask = ~cross_attn_mask if cross_attn_mask is not None else None
-            ca_out, _ = self.cross_attn(q, k, v, attn_mask=ca_mask)
-            delta = delta + ca_out
+            delta = delta + self.cross(y, cross_kv, cross_attn_mask)
         delta = delta + self.mlp(y)
         return x + delta

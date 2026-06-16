@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.nn import MultiheadAttention as MHA
 
 from src.Open_MAGVIT2.modules.predictor.attention.factorized import FactorizedSpaceTimeBlock
+from src.Open_MAGVIT2.modules.predictor.cross_conditioning import (
+    CrossConditioning,
+    remap_cross_state_dict,
+)
 
 
 class FactorizedPredictorLayer(nn.Module):
     """Process dual streams with factorized space-time attention."""
+
+    # legacy checkpoint key -> unified submodule key (CrossConditioning, §5.5)
+    _CROSS_REMAP = {
+        "cross_q_f": "cross_f.q", "cross_k_f": "cross_f.k",
+        "cross_v_f": "cross_f.v", "cross_attn_f": "cross_f.attn",
+        "cross_q_g": "cross_g.q", "cross_k_g": "cross_g.k",
+        "cross_v_g": "cross_g.v", "cross_attn_g": "cross_g.attn",
+    }
 
     def __init__(
         self,
@@ -30,14 +41,14 @@ class FactorizedPredictorLayer(nn.Module):
         self.block_g = FactorizedSpaceTimeBlock(dim, n_heads, n_spatial, **kw)
         if has_cross_attn:
             kv_dim = parent_dim if parent_dim is not None else dim
-            self.cross_q_f = nn.Linear(dim, dim)
-            self.cross_k_f = nn.Linear(kv_dim, dim)
-            self.cross_v_f = nn.Linear(kv_dim, dim)
-            self.cross_attn_f = MHA(dim, n_heads, batch_first=True)
-            self.cross_q_g = nn.Linear(dim, dim)
-            self.cross_k_g = nn.Linear(kv_dim, dim)
-            self.cross_v_g = nn.Linear(kv_dim, dim)
-            self.cross_attn_g = MHA(dim, n_heads, batch_first=True)
+            # construction order (f then g; q,k,v,attn within each) preserves the
+            # old RNG draw order -> fresh seeded init stays byte-identical.
+            self.cross_f = CrossConditioning(dim, n_heads, kv_dim)
+            self.cross_g = CrossConditioning(dim, n_heads, kv_dim)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        remap_cross_state_dict(state_dict, prefix, self._CROSS_REMAP)
+        super()._load_from_state_dict(state_dict, prefix, *args)
 
     def _cross(
         self,
@@ -45,19 +56,11 @@ class FactorizedPredictorLayer(nn.Module):
         cross_kv: torch.Tensor | None,
         cross_mask: torch.Tensor | None,
         *,
-        q_proj: nn.Linear,
-        k_proj: nn.Linear,
-        v_proj: nn.Linear,
-        attn: MHA,
+        module: CrossConditioning,
     ) -> torch.Tensor:
         if cross_kv is None:
             return x
-        q = q_proj(x)
-        k = k_proj(cross_kv)
-        v = v_proj(cross_kv)
-        ca_mask = ~cross_mask if cross_mask is not None else None
-        out, _ = attn(q, k, v, attn_mask=ca_mask)
-        return x + out
+        return x + module(x, cross_kv, cross_mask)
 
     def forward(
         self,
@@ -81,14 +84,6 @@ class FactorizedPredictorLayer(nn.Module):
                 kv_g = parent_o2 if layer_idx % 2 == 0 else parent_o1
             else:
                 kv_f = kv_g = parent_fused
-            o1 = self._cross(
-                o1, kv_f, cross_attn_mask,
-                q_proj=self.cross_q_f, k_proj=self.cross_k_f,
-                v_proj=self.cross_v_f, attn=self.cross_attn_f,
-            )
-            o2 = self._cross(
-                o2, kv_g, cross_attn_mask,
-                q_proj=self.cross_q_g, k_proj=self.cross_k_g,
-                v_proj=self.cross_v_g, attn=self.cross_attn_g,
-            )
+            o1 = self._cross(o1, kv_f, cross_attn_mask, module=self.cross_f)
+            o2 = self._cross(o2, kv_g, cross_attn_mask, module=self.cross_g)
         return torch.cat([o1, o2], dim=-1)

@@ -7,11 +7,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.Open_MAGVIT2.modules.predictor.batch_prep import PreparedBatch
 from src.Open_MAGVIT2.modules.predictor.masks import PyramidMaskBuilder, sanitize_cross_attn_mask
 from src.Open_MAGVIT2.modules.predictor.parent_condition import ParentCondition
+from src.Open_MAGVIT2.modules.predictor.rollout import Autoregressive, RolloutPolicy, TeacherForced
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule, ShiftMasks
 from src.Open_MAGVIT2.modules.predictor.stage import ShiftOutput
 
@@ -62,16 +62,8 @@ class EnvelopeOrchestrator(nn.Module):
             return 1.0 / (k + 1)
         return 1.0
 
-    def _commit_tokens(self, q_logits: torch.Tensor) -> torch.Tensor:
-        if self.commit_mode == "sample":
-            probs = F.softmax(q_logits, dim=-1)
-            b, n, k = probs.shape
-            flat = probs.reshape(b * n, k)
-            return torch.multinomial(flat, 1).reshape(b, n)
-        return q_logits.argmax(dim=-1)
-
     def forward_train(self, batch: PreparedBatch) -> PredictorOutput:
-        return self._forward_envelope(batch, mode="train")
+        return self._run_envelope(batch, TeacherForced(batch))
 
     def forward_parallel(
         self, batch: PreparedBatch, *, parallel_mode: str = "full"
@@ -87,22 +79,20 @@ class EnvelopeOrchestrator(nn.Module):
             aug = batch
         else:
             raise ValueError(f"Unknown parallel_mode: {parallel_mode!r}")
-        return self._forward_envelope(aug, mode="parallel")
+        return self._run_envelope(aug, TeacherForced(aug))
 
     def forward_autoregressive(self, batch: PreparedBatch) -> PredictorOutput:
         """Predicted embeds; finest stage re-inits from rolling buffer on k>0."""
-        rolling_ctx = {s: batch.context_embed[s].clone() for s in batch.context_embed}
-        return self._forward_envelope(
-            batch, mode="autoregressive", rolling_ctx=rolling_ctx
+        policy = Autoregressive(
+            batch, self.schedule.S - 1, sample=self.commit_mode == "sample"
         )
+        return self._run_envelope(batch, policy)
 
-    def _forward_envelope(
-        self,
-        batch: PreparedBatch,
-        *,
-        mode: str = "train",
-        rolling_ctx: Optional[Dict[int, torch.Tensor]] = None,
+    def _run_envelope(
+        self, batch: PreparedBatch, policy: RolloutPolicy
     ) -> PredictorOutput:
+        """One shared envelope loop; `policy` supplies the mode-varying decisions
+        (context source, AR re-entry, token commit). PLAN_V2 §5.1."""
         parent_by_stage: Dict[int, ParentCondition] = {}
         stream_carry: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         logits_out: Dict[Tuple[int, int], torch.Tensor] = {}
@@ -110,27 +100,18 @@ class EnvelopeOrchestrator(nn.Module):
         loss_ce = None
         finest_s = self.schedule.S - 1
 
-        for s, k in self.schedule.envelope_order():
+        for shift in self.schedule.envelope_shifts():
+            s, k = shift.stage, shift.k
+            reinit = policy.is_reinit(shift)
+
             parent = None
-            if s > 0:
-                ps, pk = self.schedule.parent_for(s, k)
-                assert ps is not None and pk is not None
+            if not shift.is_root:
+                ps, _pk = shift.parent
                 parent = parent_by_stage.get(ps)
 
             n_sp = self.schedule.stages[s].n_spatial
-            ar_reinit = (
-                mode == "autoregressive"
-                and rolling_ctx is not None
-                and s == finest_s
-                and k > 0
-            )
-            if k == 0 or ar_reinit:
-                if mode == "parallel":
-                    ctx = batch.context_embed[s]
-                elif rolling_ctx is not None and (k == 0 or ar_reinit):
-                    ctx = rolling_ctx[s]
-                else:
-                    ctx = batch.context_embed[s]
+            if shift.is_first or reinit:
+                ctx = policy.initial_context(shift)
                 prev = None
             else:
                 ctx = None
@@ -141,7 +122,7 @@ class EnvelopeOrchestrator(nn.Module):
             t_len = n_tokens // n_sp
 
             masks = batch.masks[(s, k)]
-            if ar_reinit:
+            if reinit:
                 device = ctx.device
                 full_self = self.mask_builder.build_self_attn_mask(
                     s, self.temporal_windows[s], device
@@ -168,7 +149,7 @@ class EnvelopeOrchestrator(nn.Module):
                 masks=shift_masks,
                 t_len=t_len,
             )
-            if not ar_reinit:
+            if not reinit:
                 stream_carry[(s, k)] = (out.o1, out.o2)
             parent_by_stage[s] = self._parent_from_output(out, s)
             logits_out[(s, k)] = out.logits
@@ -176,22 +157,16 @@ class EnvelopeOrchestrator(nn.Module):
             sup = batch.supervision[s][k]
             q_logits = out.logits[:, sup.query_positions]
             tgt = batch.target_indices[s][k]
-            ce = F.cross_entropy(
-                q_logits.reshape(-1, q_logits.shape[-1]).float(),
-                tgt.reshape(-1),
-            )
+            ce = self.stages[s].shift_cross_entropy(q_logits, tgt)
             ce_breakdown[(s, k)] = ce.detach()
             w = self._ce_weight(s, k)
             loss_ce = ce * w if loss_ce is None else loss_ce + ce * w
 
-            if mode == "autoregressive" and rolling_ctx is not None and s == finest_s:
-                pred_tok = self._commit_tokens(q_logits)
-                embed_frame = self.stages[s].embed_token_ids(pred_tok)
-                rolling_ctx[s] = torch.cat([rolling_ctx[s], embed_frame], dim=1)
+            policy.on_output(shift, self.stages[s], q_logits)
 
         pred_indices = self._collect_pred_indices(batch, logits_out)
 
-        ar_len = rolling_ctx[finest_s].shape[1] if rolling_ctx is not None else None
+        ar_len = policy.final_ar_len(finest_s)
         return PredictorOutput(
             loss_ce=loss_ce if loss_ce is not None else torch.tensor(0.0),
             loss_mse=None,
@@ -214,7 +189,9 @@ class EnvelopeOrchestrator(nn.Module):
             for k in range(self.schedule.shifts_per_stage(s)):
                 sup = batch.supervision[s][k]
                 q_logits = logits[(s, k)][:, sup.query_positions]
-                pred_tok = self._commit_tokens(q_logits)
+                pred_tok = self.stages[s].commit_index(
+                    q_logits, sample=self.commit_mode == "sample"
+                )
                 tgt_t = self.schedule.target_token_index(s, k)
                 b = idx.shape[0]
                 idx[:, tgt_t] = pred_tok.reshape(b, h, w)

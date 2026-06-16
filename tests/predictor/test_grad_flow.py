@@ -128,15 +128,17 @@ def test_legacy_one_to_one_cross_mask_kills_qk_grads(video):
     )
     loss.backward()
     fine = legacy.predictor_stages[2]
+    # CrossConditioning (§5.5) renamed the explicit q/k/v projections from
+    # cross_q_f/cross_k_f/cross_v_f to cross_f.q/cross_f.k/cross_f.v (+ _g).
     qk_sum = sum(
         p.grad.abs().sum().item()
         for name, p in fine.named_parameters()
-        if ("cross_q" in name or "cross_k" in name) and p.grad is not None
+        if "cross" in name and (".q." in name or ".k." in name) and p.grad is not None
     )
     v_sum = sum(
         p.grad.abs().sum().item()
         for name, p in fine.named_parameters()
-        if "cross_v" in name and p.grad is not None
+        if "cross" in name and ".v." in name and p.grad is not None
     )
     assert qk_sum == 0.0, "legacy mask unexpectedly produced q/k gradient"
     assert v_sum > 0.0

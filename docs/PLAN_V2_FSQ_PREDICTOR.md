@@ -26,6 +26,37 @@
 
 ---
 
+## 0.5 IMPLEMENTATION STATUS (updated 2026-06-15)
+
+- **Path 2 (FSQ + temporal-align): DONE** (commit `6c6e5c7`). FSQ quantizer (§4),
+  builder dispatch + `_levels_map` (H1), `temporal_align_mode: causal`
+  `_upsample_state_to_finest` (§1.3), gate G1-informational note (M3), tests. Runs:
+  `bllr9fzo` (match-K, gate-ready, recon 0.00019) and `dr8vrkt8` (rightsized
+  512/1024/256, recon 0.000255 @ ep18, in progress) — the optional size ablation.
+- **Path 3.0/3.1 (predictor hygiene + structural refactor): DONE, behavior-preserving**
+  (uncommitted on `refactor/v2-predictor-and-fsq`, tag `pre-path3-baseline`). Landed:
+  `enums.py` (§5.3), `shift.py` + `envelope_shifts` (§5.2), `PredictorConfig`/
+  `StageConfig` (§5.4), `CrossConditioning` + state-dict remap (§5.5/H4),
+  `RolloutPolicy` collapse of the envelope loop (§5.1/B4). Golden CE bit-equality
+  (`test_golden_refactor.py` + `_golden/` fixture) holds across all 4 modes through
+  every step; 114/114 predictor tests pass. See PROJECT_MEMORY §0.1 for details.
+- **Corrections to THIS plan, found in implementation** (full reasoning in
+  PROJECT_MEMORY §0.1):
+  - **§5.6 predictor `_lr_annealing` removal — DO NOT DO** (it is *live* in
+    `training_step`, not dead; removal changes the LR schedule). "asserts→ValueError"
+    is moot (no asserts in that file). KEPT.
+  - **§5.6 `video_hier_vqgan.py` dead-code (M4) — DEFERRED** to after the encoder run
+    (live tokenizer module; remove on the P0/tokenizer track to avoid resume risk).
+  - **§5.5 "reversible_block.py:50-67"** is `set_parent`, not param defs; duplication
+    is indirect via F/G (`ParallelPredictorResidual`).
+  - **§5.7 ordering**: record the golden FIRST (at baseline), assert after each step.
+  - **§5.1 interface** simplified — orchestrator keeps generic mechanics; policy owns
+    only context-source / `is_reinit` / `on_output` / `final_ar_len`.
+- **NOT started (gated by GATE-T + frozen+pre-tokenized tokenizer):** §6 RoPE,
+  §7 Flex/KV/pre-tokenize/bf16, §8 dense supervision + scheduled sampling.
+
+---
+
 ## 1. The t=1 fuzzy-frame artifact — verified root cause & fix
 
 ### 1.1 What it is (evidence)

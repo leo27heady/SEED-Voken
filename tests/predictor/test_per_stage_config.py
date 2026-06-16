@@ -73,6 +73,39 @@ def test_prd_01_predictor_init_v4_smoke():
     assert model.predictor_stages[3].attention_type == "factorized"
 
 
+def test_prd_03_fsq_tokenizer_predictor_build():
+    """Predictor must build on an FSQ tokenizer config (levels only, no
+    size_dict/dim_dict). Regression for the FSQ->predictor wiring gap."""
+    from src.Open_MAGVIT2.models.video_hier_predictor import VideoHierPredictorModel
+
+    model = VideoHierPredictorModel(
+        vae_config="configs/Open-MAGVIT2/gpu/shapes3d_fsq_32_S_lite_pyr_smoke.yaml",
+        t_context=5,
+        t_total=9,
+        predictor={
+            "dim": [64, 32, 32],
+            "n_layers": [1, 1, 1],
+            "n_heads": [4, 4, 4],
+            "temporal_windows": [-1, 3, 1],
+            "codebook_dim": [16, 16, 16],  # widen vs the FSQ value-dim (3)
+            "attention": {
+                "per_stage": [
+                    {"type": "full"},
+                    {"type": "factorized", "t_window": 3},
+                    {"type": "factorized", "t_window": 1, "spatial_window": 4},
+                ],
+            },
+        },
+        loss={"lambda_pred_mse": 0.0},
+    )
+    assert model.schedule.S == 3
+    # K = prod(levels); smoke levels are [4,4,4] per stage -> 64 each
+    assert [model.predictor_stages[s].codebook_size for s in range(3)] == [64, 64, 64]
+    assert model.predictor_stages[0].codebook_dim == 16  # override applied
+    # FSQ has no learned codebook -> _copy_codebooks skips -> embed stays trainable
+    assert model.predictor_stages[0].codebook_embed.weight.requires_grad
+
+
 def test_prd_02_codebook_proj_decoupled_dim():
     import torch
 

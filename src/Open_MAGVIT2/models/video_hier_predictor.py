@@ -13,7 +13,7 @@ import yaml
 from src.Open_MAGVIT2.models.video_hier_vqgan import VideoHierVQModel
 from src.Open_MAGVIT2.modules.predictor.batch_prep import BatchPrep
 from src.Open_MAGVIT2.modules.predictor.masks import PredictorMaskCache
-from src.Open_MAGVIT2.modules.predictor.config import resolve_stage_attention, stage_list
+from src.Open_MAGVIT2.modules.predictor.config import PredictorConfig
 from src.Open_MAGVIT2.modules.predictor.metrics import (
     build_train_log_dict,
     build_val_log_dict,
@@ -21,6 +21,9 @@ from src.Open_MAGVIT2.modules.predictor.metrics import (
 from src.Open_MAGVIT2.modules.predictor.orchestrator import EnvelopeOrchestrator
 from src.Open_MAGVIT2.modules.predictor.schedule import PyramidSchedule
 from src.Open_MAGVIT2.modules.predictor.stage import PredictorStage
+from src.Open_MAGVIT2.modules.vqvae.hierarchical.quantizer_builder import (
+    resolve_quantizer_sizes,
+)
 
 
 class VideoHierPredictorModel(L.LightningModule):
@@ -95,15 +98,14 @@ class VideoHierPredictorModel(L.LightningModule):
         self.wp0 = wp0
         self.sche_type = sche_type
 
-        q_cfg = model_cfg["quantizer"]
-        sizes = q_cfg["size_dict"]
-        dims = q_cfg["dim_dict"]
-        
-        if isinstance(sizes, int):
-            sizes = [sizes]
-
-        if isinstance(dims, int):
-            dims = [dims]
+        # FSQ/LFQ configs carry per-layer `levels`, not size_dict/dim_dict; derive
+        # them so the predictor (and from_encoder_audit below) can build on any
+        # quantizer family. Inject the resolved values so from_encoder_audit, which
+        # also keys off size_dict/dim_dict, sees them.
+        q_cfg = dict(model_cfg["quantizer"])
+        sizes, dims = resolve_quantizer_sizes(q_cfg)
+        q_cfg["size_dict"] = sizes
+        q_cfg["dim_dict"] = dims
 
         stages_cfg = PyramidSchedule.from_encoder_audit(
             model_cfg["ddconfig"],
@@ -114,67 +116,80 @@ class VideoHierPredictorModel(L.LightningModule):
         )
         self.schedule = stages_cfg
 
-        S = self.schedule.S
-        stage_dims = [int(d) for d in stage_list(predictor.get("dim", 32), S, "dim")]
-        stage_layers = [int(n) for n in stage_list(predictor.get("n_layers", 4), S, "n_layers")]
-        stage_heads = [int(n) for n in stage_list(predictor.get("n_heads", 8), S, "n_heads")]
-        default_windows = [-1, 3, 1] if S == 3 else [-1] * S
-        temporal_windows = [
-            int(w) for w in stage_list(
-                predictor.get("temporal_windows", default_windows), S, "temporal_windows"
-            )
-        ]
-        attention_cfg = predictor.get("attention", {})
-        max_shifts = self.schedule.ratio ** (self.schedule.S - 1)
-        use_rev_bp = bool(predictor.get("use_reversible_backprop", False))
-
-        for s in range(S):
-            if stage_dims[s] % stage_heads[s] != 0:
+        cross_window = int(predictor.get("cross_spatial_window", 0))
+        # Output head mode: "composite" (one K-way softmax; default, required for
+        # SQ) or "factorized_fsq" (per-FSQ-channel softmaxes; needs the tokenizer
+        # 'levels'). Factorized matches FSQ's mixed-radix structure (see
+        # finding-fsq-predictor-composite-index).
+        output_mode = predictor.get("output_mode", "composite")
+        levels_per_stage = None
+        if output_mode == "factorized_fsq":
+            qtype = str(q_cfg.get("type", "sq")).lower()
+            if qtype not in ("fsq", "lfq") or "levels" not in q_cfg:
                 raise ValueError(
-                    f"predictor.dim[{s}]={stage_dims[s]} must be divisible by "
-                    f"predictor.n_heads[{s}]={stage_heads[s]}"
+                    "predictor.output_mode='factorized_fsq' requires an fsq/lfq "
+                    "tokenizer config with per-stage 'levels'"
                 )
+            lv = q_cfg["levels"]
+            levels_per_stage = lv if isinstance(lv[0], (list, tuple)) else [lv]
+            if len(levels_per_stage) != self.schedule.S:
+                raise ValueError(
+                    f"quantizer.levels has {len(levels_per_stage)} entries != "
+                    f"{self.schedule.S} predictor stages"
+                )
+        # Single typed source of truth; validation happens in PredictorConfig
+        # __post_init__ (enum membership, dim % n_heads). Mirrors the previous
+        # inline per-stage resolution exactly (PLAN_V2 §5.4).
+        self.predictor_config = PredictorConfig.from_predictor_cfg(
+            self.schedule,
+            predictor,
+            t_total=t_total,
+            parent_mode=parent_conditioning,
+            commit_mode=self.commit_mode,
+            shift_ce_weights=loss.get("shift_ce_weights", "uniform"),
+            lambda_pred_mse=self.lambda_pred_mse,
+            cross_spatial_window=cross_window,
+            use_reversible_backprop=bool(predictor.get("use_reversible_backprop", False)),
+            codebook_dims=dims,
+            output_mode=output_mode,
+            levels_per_stage=levels_per_stage,
+        )
+        cfg = self.predictor_config
+        temporal_windows = cfg.temporal_windows
 
         pred_stages = nn.ModuleList()
-        for s, spec in enumerate(self.schedule.stages):
-            has_parent = s > 0
-            stage_attn = resolve_stage_attention(attention_cfg, s, temporal_windows)
-            attn_type = stage_attn.get("type", "full")
-            t_window = stage_attn.get("t_window", temporal_windows[s])
-            spatial_window = stage_attn.get("spatial_window")
-            parent_dim = stage_dims[s - 1] if has_parent else None
-            vae_codebook_dim = int(dims[s])
-
+        for sc in cfg.stages:
             pred_stages.append(
                 PredictorStage(
-                    dim=stage_dims[s],
-                    n_heads=stage_heads[s],
-                    n_layers=stage_layers[s],
-                    codebook_size=spec.codebook_size,
-                    codebook_dim=vae_codebook_dim,
-                    h=spec.H,
-                    w=spec.W,
-                    max_t=t_total,
-                    max_shifts=max_shifts,
-                    has_parent=has_parent,
-                    parent_dim=parent_dim,
-                    parent_mode=parent_conditioning,
-                    attention_type=attn_type,
-                    t_window=t_window,
-                    spatial_window=spatial_window,
-                    use_reversible_backprop=use_rev_bp,
+                    dim=sc.dim,
+                    n_heads=sc.n_heads,
+                    n_layers=sc.n_layers,
+                    codebook_size=sc.codebook_size,
+                    codebook_dim=sc.codebook_dim,
+                    h=sc.h,
+                    w=sc.w,
+                    max_t=cfg.max_t,
+                    max_shifts=cfg.max_shifts,
+                    has_parent=sc.has_parent,
+                    parent_dim=sc.parent_dim,
+                    parent_mode=cfg.parent_mode,
+                    attention_type=sc.attention_type,
+                    t_window=sc.t_window,
+                    spatial_window=sc.spatial_window,
+                    use_reversible_backprop=cfg.use_reversible_backprop,
+                    output_mode=sc.output_mode,
+                    levels=list(sc.levels) if sc.levels else None,
                 )
             )
         self.predictor_stages = pred_stages
-        cross_window = int(predictor.get("cross_spatial_window", 0))
         self.orchestrator = EnvelopeOrchestrator(
             pred_stages,
             self.schedule,
-            parent_mode=parent_conditioning,
-            lambda_pred_mse=self.lambda_pred_mse,
-            shift_ce_weights=loss.get("shift_ce_weights", "uniform"),
+            parent_mode=cfg.parent_mode,
+            lambda_pred_mse=cfg.lambda_pred_mse,
+            shift_ce_weights=cfg.shift_ce_weights,
             temporal_windows=temporal_windows,
-            commit_mode=self.commit_mode,
+            commit_mode=cfg.commit_mode,
         )
         self.mask_cache = PredictorMaskCache(
             self.schedule, temporal_windows, cross_spatial_window=cross_window

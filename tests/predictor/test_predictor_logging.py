@@ -30,8 +30,9 @@ def _build_stack():
 
 
 class _MockModel:
-    def __init__(self, schedule):
+    def __init__(self, schedule, stages=None):
         self.schedule = schedule
+        self.predictor_stages = stages
         self.t_context = 9
         self.t_total = 13
         self.lambda_ce = 1.0
@@ -68,7 +69,7 @@ def test_token_accuracy_from_output():
     with torch.no_grad():
         batch = prep.encode_and_schedule(vae, video, stages)
         out = orch.forward_train(batch)
-    acc = token_accuracy_from_output(out, batch, schedule)
+    acc = token_accuracy_from_output(out, batch, schedule, stages)
     assert len(acc) == schedule.S
     for s, a in acc.items():
         assert 0.0 <= a.item() <= 1.0
@@ -83,7 +84,7 @@ def test_build_train_log_dict_keys():
         batch = prep.encode_and_schedule(vae, video, stages)
         batch.video = video
         out = orch.forward_train(batch)
-    mock = _MockModel(schedule)
+    mock = _MockModel(schedule, stages)
     loss = total_loss(out.loss_ce, out.loss_mse, lambda_ce=1.0, lambda_pred_mse=0.5)
     log = build_train_log_dict(mock, out, batch, loss_total=loss)
     assert "train/loss_ce" in log
@@ -103,7 +104,7 @@ def test_build_val_log_dict_keys():
         batch.video = video
         out_ar = orch.forward_train(batch)
         out_par = orch.forward_train(batch)
-    mock = _MockModel(schedule)
+    mock = _MockModel(schedule, stages)
     loss_ar = total_loss(out_ar.loss_ce, None, lambda_ce=1.0, lambda_pred_mse=0.5)
     log = build_val_log_dict(
         mock,

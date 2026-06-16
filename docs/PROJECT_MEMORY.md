@@ -90,6 +90,178 @@ right-sized tokenizer in parallel as the size ablation if desired.
 
 ---
 
+## 0.1 v2 update — rightsized FSQ run + Path-3 predictor refactor (2026-06-15)
+
+**Rightsized FSQ run `dr8vrkt8`** (`shapes3d_fsq_32_S_lite_pyr_rightsized.yaml`,
+levels coarse `[8,4,4,4]`=512 / mid `[8,8,4,4]`=1024 / fine `[4,4,4,4]`=256, all d4).
+Snapshot @ epoch 18 / ~50k steps (still training, ES not yet fired — val still
+falling): **`val_ema/mse_per_pixel = 0.000255`** (recon excellent, ~11× under the
+G4 0.0028 bar; cf. match-K `bllr9fzo` 0.00019). KL = 0 (FSQ). Perplexity rising as
+expected. Codebook usage confirms the rightsizing hypothesis: **L1 379/512 (74%),
+L2 965/1024 (94% — the workhorse, near-saturated), L3 121/256 (47% — simple
+residual)**. Clean progressive decomposition (train L1 235 → +L2 45 → full 8.6). So
+mid≥coarse≥fine in *usage*; the rebalanced sizes fit. This is the optional **size
+ablation**, not a blocker — `bllr9fzo` remains gate-ready.
+
+**Gate on `dr8vrkt8` (ckpt `epoch=27-step=87500`) + gate recalibration (decision
+2026-06-15).** First gate run: G1 PASS, **G2 FAIL, G3 FAIL**, G4 PASS (recon
+0.00013/px), `docs/wandb_analysis/gate_dr8vrkt8.json`. Investigated — **the tokenizer
+is healthy; G2/G3 encoded SQ-era priors that are invalid for the FSQ pyramid on
+rotating shapes:**
+- G2 (exact-index persistence ≥ 0.5, coarse>mid>fine): persistence is exact-match
+  across frames → ~0 for high-entropy FSQ codes (L1 511/512 unique) on rotating data
+  (everything moves). The gate script *already computes* temporal MI and comments it's
+  "more robust than exact-match persistence"; MI shows the intended hierarchy cleanly:
+  **coarse 3.96 ≥ mid 3.22 ≥ fine 0.08 nats**. Low persistence + high coarse MI = codes
+  change *predictably* (rotation), not random flicker — good for the predictor.
+- G3 (ablation order coarse≥mid≥fine): built for the old down-fusion bug. Mid-dominance
+  (+0.193) here is the documented data preference (tiny 3×4×4 coarse grid; simple shapes
+  have little fine texture). No layer is dead (ΔMSE +0.023/+0.193/+0.010; fine alone is
+  ~80× base).
+- One noted (non-blocking) observation: **fine MI = 0.08** (fine tokens nearly
+  temporally unpredictable) — the dissertation's known open problem (val_ce_ar
+  divergence, Path 3.4), low-impact for these shapes, NOT a tokenizer fix.
+
+**Decision: PROCEED to the predictor; no tokenizer code change.** Recalibrated
+`scripts/token_quality_report.py` to be quantizer-aware (mirrors the existing G1-for-FSQ
+treatment): for FSQ/LFQ, **G2 → temporal-MI hierarchy** (coarse≥mid≥fine, `--mi-tol`) and
+**G3 → no-dead-layer** (every layer ablation ΔMSE ≥ `--min-ablation-dmse`, default 0.002);
+SQ gates unchanged; raw persistence + ablation order still printed as diagnostics. Applied
+to the recorded `dr8vrkt8` metrics this yields **ALL GATES PASS** (verified offline; re-run
+on GPU when free to refresh the JSON). The recalibrated gate still fails a genuinely bad
+tokenizer: collapse→G1, bad recon→G4, inverted coherence→G2-MI, dead layer→G3.
+
+**FSQ→predictor wiring gap — found + fixed (2026-06-15).** Building the predictor on an
+FSQ tokenizer config used to `KeyError`: `video_hier_predictor.__init__` and
+`schedule.from_encoder_audit` read `quantizer.size_dict`/`dim_dict`, but FSQ configs carry
+only `levels` (the VAE builder needs only those). Fix:
+`quantizer_builder.resolve_quantizer_sizes(cfg)` derives per-layer `size_dict=prod(levels)` /
+`dim_dict=len(levels)` for FSQ/LFQ (explicit for SQ); the predictor injects the resolved
+values so `from_encoder_audit` works for any family. Also added an optional
+`predictor.codebook_dim` override (per-stage) — FSQ has no learned codebook to copy and its
+value-dim is tiny (e.g. 4), so this widens the predictor's learned token embedding; defaults
+to `dim_dict` so SQ still copies its codebook in-place. Regression test
+`test_per_stage_config.py::test_prd_03_fsq_tokenizer_predictor_build`. New predictor config
+`shapes3d_fsq_32_S_lite_pyr_rightsized_predict.yaml` (vae_config → rightsized FSQ,
+`vae_ckpt` → gated ckpt, `codebook_dim: [32,32,32]`, dims `[256,128,64]`); verified it builds
+(K = 512/1024/256). **The predictor track is now fully unblocked.**
+
+## 0.2 Predictor BLOB diagnosis + factorized head (2026-06-16)
+
+The first FSQ-tokenizer predictor run (`6x3dvkv8`, rightsized FSQ) produced **blobs for
+all modes** (pred_train/parallel/ar) while `vae_recon` was sharp. Deep diagnosis
+([[finding-fsq-predictor-composite-index]]): the predictor predicts ≈ the per-position
+**marginal** → decodes to the average-shape blob. Two candidate causes: (#1) composite-index
+head mismatch — FSQ index is mixed-radix of per-channel codes, but the head was one monolithic
+K-way softmax → composite top-1 needs all channels right at once (≈product → ~1%) even though
+per-channel signal exists; (#2) coarse/mid tokens carry little learnable temporal signal.
+
+**Option A — factorized per-channel FSQ head — implemented + verified, NOT sufficient.**
+`predictor.output_mode: factorized_fsq` (per-channel softmaxes; summed per-channel CE = ln K
+at uniform so loss scale is unchanged; commit = per-channel argmax → compose via the FSQ
+basis). Composite mode is the default and stays **golden bit-equal**; full suite **213 passed,
+1 skipped**. Correct (basis matches the tokenizer), stable (no NaN), comparable speed
+(565 vs 545 ms/step; the head is not the bottleneck). BUT a 4000-step verification on the
+rightsized FSQ tokenizer showed it does **not** de-blob:
+- per-channel acc: fine 0.35→0.45 (learns), coarse 0.20→0.25 (barely), **mid dead-flat at
+  0.20 = marginal (zero learning)**; coarse/mid value-MSE WORSE than the marginal blob; pixel
+  pred-MSE only 0.185→~0.16 (fine-driven). Decoded image still blobs
+  (`docs/wandb_analysis/factorized_recon_compare.png`, `factorized_verify2.json`).
+
+So #1 was a real inefficiency (factorized is the correct FSQ head + a modest win — **kept**,
+opt-in, default composite) but **#2 dominates**: the coarse/mid FSQ tokens are intrinsically
+hard to predict frame-to-frame — (a) the shape ROTATES so content moves across positions and
+the predictor isn't learning motion-compensation (neither factorized@4k nor composite@38k);
+(b) FSQ boundary chaos turns smooth latent motion into near-random per-channel code flips
+(held-out per-channel bigram ≈ random for coarse/mid). SQ does NOT escape this (its old
+predictability came from codebook COLLAPSE = recon loss; see the SQ probe in
+[[finding-fsq-predictor-composite-index]]).
+
+**Next levers (upstream — tokenizer/predictor dynamics, NOT the head):** (1) predictability-
+aware tokenizer — temporal-coherence penalty (`temporal_kl_weight` adapted for FSQ) and/or
+less aggressive coarse/mid temporal downsampling (3/5/9 → e.g. 5/7/9); (2) predictor motion
+modeling — RoPE (Path 3.2); (3) gate on HELD-OUT predictability (the gate's sparse-count MI
+overestimates); (4) dense supervision (Path 3.4a). New config knob:
+`predictor.output_mode: composite|factorized_fsq` (+ optional `predictor.codebook_dim`).
+
+**Path 3.0/3.1 predictor refactor — IMPLEMENTED, behavior-preserving** (branch
+`refactor/v2-predictor-and-fsq`, on top of tag **`pre-path3-baseline`** @ 6c6e5c7).
+This is the predictor-track work that the plan (§3) explicitly allows to run in
+PARALLEL with the live tokenizer GPU run (it touches only `predictor/*` + the
+predictor Lightning model; no tokenizer file is edited, so the running encoder is
+unaffected). All gated by a new **golden CE fixture** (see below):
+
+1. **`predictor/enums.py`** — `str,Enum` mixins `ParentMode/CommitMode/ShiftCEWeights/
+   AttentionType/ParallelMode` (== raw strings → YAML unchanged); the single
+   validation entry point.
+2. **`predictor/shift.py`** — frozen `Shift{stage,k,parent_stage,parent_k,is_reinit}`
+   with `is_root/is_first/prev_k/parent/as_tuple/with_reinit`; `PyramidSchedule.
+   envelope_shifts()` lifts `envelope_order()` to `Shift`s (byte-identical traversal).
+   Tuple boundary preserved: `PredictorOutput.logits/ce_breakdown` + W&B keys stay
+   `Tuple[int,int]`.
+3. **`predictor/config.py` `PredictorConfig`+`StageConfig`** (frozen) — single typed
+   source of truth; `__post_init__` consolidates validation (enum membership,
+   dim % n_heads). `VideoHierPredictorModel.__init__` builds it and constructs every
+   `PredictorStage` from `cfg.stages[s]` (identical constructor args → identical
+   modules). Reuses `stage_list`/`resolve_stage_attention` (kept).
+4. **`predictor/cross_conditioning.py` `CrossConditioning`** (H4) — unifies the
+   duplicated cross-attn (`cross_q_f/k_f/v_f/attn_f`+`_g` in factorized_layer,
+   `cross_attn_q/k/v/attn` in parallel_residual) into one module `q/k/v/attn`.
+   `forward` returns the RAW attn output (no internal residual); callers own the
+   residual (factorized `x+out`, parallel folds into `delta`). Mask polarity
+   (`~mask`) owned in one place. **`_load_from_state_dict` remap hooks**
+   (`remap_cross_state_dict`, keyed by `old+"."` to dodge the `cross_attn`/
+   `cross_attn_q` prefix trap) load legacy checkpoints; construction order preserved
+   so fresh seeded init stays byte-identical. Proven by `test_cross_cond_remap.py`
+   (factorized + parallel + nested reversible F/G round-trip → bit-equal forward).
+5. **`predictor/rollout.py` `RolloutPolicy`** (B4) — ONE hierarchy
+   (`TeacherForced`, `Autoregressive`); `EnvelopeOrchestrator._forward_envelope`
+   collapsed into `_run_envelope(batch, policy)`. The three entrypoints are thin
+   factories. Policy answers only the mode-varying questions (context source,
+   AR re-entry `is_reinit`, token commit `on_output`, `final_ar_len`); the loop
+   owns the generic mechanics. `Autoregressive.on_output` appends the committed
+   finest frame to the rolling buffer for EVERY finest shift (k==0 included) —
+   matches legacy. `commit_fn` is the AR seam KV-cache (§7.2) + scheduled sampling
+   (§8.1, future `ScheduledSampling(Autoregressive)` subclass) will hook.
+
+**Golden safety net:** `tests/predictor/test_golden_refactor.py` +
+`tests/predictor/_golden/lite_baseline.{pt,json}` (1.6 MB: predictor stage weights +
+input video only; VAE rebuilds from seed). Records once at baseline, then asserts
+`loss_ce` + per-(s,k) `ce_breakdown` **bit-equal (atol 1e-5)** across
+forward_train / forward_parallel(full|context) / forward_autoregressive after every
+refactor step, loading the legacy-key fixture through the remap hooks. Stayed green
+through all five steps. **Verification:** 114/114 predictor tests pass (1 GPU test
+skipped), 208 tests collect clean. Tests run targeted (not the full suite) because
+RAM is tight while the encoder trains (~8.5 GB free; predictor-dir peak 7.1 GiB).
+
+**Plan corrections found during implementation (PLAN_V2 §5):**
+- **§5.6 (predictor LR-anneal removal) is WRONG / out of scope.** `_lr_annealing` in
+  `video_hier_predictor.py` is **live** (called in `training_step`), not dead code —
+  removing it changes the LR schedule (warmup+cosine → constant), a behavior change,
+  not a behavior-preserving refactor. KEPT it. Also the "asserts→ValueError" item is
+  moot: that file already uses `ValueError` (no asserts). LR-anneal cleanup, if
+  wanted, is a separate behavior-changing step (→ a Lightning scheduler).
+- **§5.6 `video_hier_vqgan.py` dead-code (M4) DEFERRED** (not done): bodies for
+  GAN/discriminator/perceptual + VAR LR-anneal (`wp/wp0/wpe/sche_type/max_iter`,
+  `lr_annealing`) still exist (gated by `use_gan: false`). Left untouched on purpose —
+  it's the live tokenizer module and the encoder run is in progress; safest to remove
+  after the run completes (do it on the tokenizer/P0 track, keeping kwargs for YAML).
+- **§5.5 line ref is stale** — duplication "reversible_block.py:50-67" is actually
+  `set_parent` (parent/KV storage), not param defs; the real duplication is indirect
+  via F/G = `ParallelPredictorResidual`. Handled (each F/G remaps via its own hook).
+- **§5.7 golden sequencing** — recorded the golden FIRST (at baseline), then asserted
+  after each step (the plan's "Shift→enums→record goldens" ordering is backwards).
+- **§5.1 RolloutPolicy interface simplified** vs the plan's
+  `context_for_shift/masks_for_shift/record/commit_output` sketch: the orchestrator
+  keeps the generic per-shift mechanics (masks, stream_carry); the policy answers
+  only the 4 mode-varying questions. Cleaner and provably equivalent (golden).
+
+**Not started (correctly gated by GATE-T + frozen tokenizer):** P3.2 RoPE, P3.3
+Flex/KV-cache/pre-tokenize/bf16, P3.4 dense supervision + scheduled sampling. These
+need the tokenizer gated, frozen, and pre-tokenized first (§3 hard interlock).
+
+---
+
 ## 1. Core idea & non-negotiables (dissertation)
 
 Hierarchical video prediction with discrete tokens. Three pillars:

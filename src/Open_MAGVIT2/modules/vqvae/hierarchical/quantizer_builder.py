@@ -1,8 +1,38 @@
-from typing import List, Optional
+import math
+from typing import List, Optional, Tuple
 
 from torch import nn
 
 from src.Open_MAGVIT2.modules.vqvae.hierarchical.gaussian_sq import GaussianSQQuantizer
+
+
+def resolve_quantizer_sizes(quantizer_cfg: dict) -> Tuple[List[int], List[int]]:
+    """Per-layer ``(size_dict, dim_dict)`` from a quantizer config, FSQ/LFQ-aware.
+
+    SQ configs carry explicit ``size_dict``/``dim_dict``. FSQ/LFQ configs carry
+    per-layer ``levels`` instead (the builder needs only those), so the predictor
+    — which keys off ``size_dict``/``dim_dict`` — derives ``K=prod(levels)`` and
+    ``d=len(levels)`` per layer. Without this, building a predictor on an FSQ
+    tokenizer config raises ``KeyError: 'size_dict'``."""
+    if "size_dict" in quantizer_cfg and "dim_dict" in quantizer_cfg:
+        sizes = quantizer_cfg["size_dict"]
+        dims = quantizer_cfg["dim_dict"]
+        sizes = [sizes] if isinstance(sizes, int) else list(sizes)
+        dims = [dims] if isinstance(dims, int) else list(dims)
+        return sizes, dims
+    qtype = str(quantizer_cfg.get("type", "sq")).lower()
+    if qtype in ("fsq", "lfq"):
+        levels = quantizer_cfg.get("levels")
+        if levels is None:
+            raise ValueError(f"{qtype} quantizer requires per-layer 'levels'")
+        per_layer = levels if isinstance(levels[0], (list, tuple)) else [levels]
+        sizes = [int(math.prod(lv)) for lv in per_layer]
+        dims = [len(lv) for lv in per_layer]
+        return sizes, dims
+    raise KeyError(
+        "quantizer config has neither size_dict/dim_dict nor fsq/lfq levels: "
+        f"{sorted(quantizer_cfg)}"
+    )
 
 
 def build_layer_quantizer(
