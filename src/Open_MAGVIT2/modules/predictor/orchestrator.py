@@ -24,6 +24,10 @@ class PredictorOutput:
     pred_indices: Dict[int, torch.Tensor]
     ar_context_len: Optional[int] = None
     ce_breakdown: Optional[Dict[Tuple[int, int], torch.Tensor]] = None
+    # CE on the canonical target frame only (last n_sp query positions). Equals
+    # loss_ce in single-frame mode; under dense supervision it is the gate-
+    # comparable metric (PLAN_V2 §8.1a, _lasttok). Always populated.
+    loss_ce_lasttok: Optional[torch.Tensor] = None
 
 
 class EnvelopeOrchestrator(nn.Module):
@@ -98,6 +102,7 @@ class EnvelopeOrchestrator(nn.Module):
         logits_out: Dict[Tuple[int, int], torch.Tensor] = {}
         ce_breakdown: Dict[Tuple[int, int], torch.Tensor] = {}
         loss_ce = None
+        loss_ce_lasttok = None
         finest_s = self.schedule.S - 1
 
         for shift in self.schedule.envelope_shifts():
@@ -162,7 +167,17 @@ class EnvelopeOrchestrator(nn.Module):
             w = self._ce_weight(s, k)
             loss_ce = ce * w if loss_ce is None else loss_ce + ce * w
 
-            policy.on_output(shift, self.stages[s], q_logits)
+            # Canonical (last) frame slice: under dense supervision it's the tail
+            # n_sp transition (p=ctx_end -> tgt_t); identical to `ce` otherwise.
+            # Used for commit, AR re-entry, and the gate-comparable `_lasttok` CE.
+            q_logits_last = q_logits[:, -n_sp:]
+            tgt_last = tgt[:, -n_sp:]
+            ce_last = self.stages[s].shift_cross_entropy(q_logits_last, tgt_last)
+            loss_ce_lasttok = (
+                ce_last * w if loss_ce_lasttok is None else loss_ce_lasttok + ce_last * w
+            )
+
+            policy.on_output(shift, self.stages[s], q_logits_last)
 
         pred_indices = self._collect_pred_indices(batch, logits_out)
 
@@ -174,6 +189,9 @@ class EnvelopeOrchestrator(nn.Module):
             pred_indices=pred_indices,
             ar_context_len=ar_len,
             ce_breakdown=ce_breakdown,
+            loss_ce_lasttok=(
+                loss_ce_lasttok if loss_ce_lasttok is not None else torch.tensor(0.0)
+            ),
         )
 
     def _collect_pred_indices(
@@ -186,9 +204,12 @@ class EnvelopeOrchestrator(nn.Module):
             idx = batch.gt_indices[s].clone()
             spec = self.schedule.stages[s]
             h, w = spec.H, spec.W
+            n_sp = spec.n_spatial
             for k in range(self.schedule.shifts_per_stage(s)):
                 sup = batch.supervision[s][k]
-                q_logits = logits[(s, k)][:, sup.query_positions]
+                # canonical target frame = last n_sp query positions (tail under
+                # dense supervision; the whole frame otherwise).
+                q_logits = logits[(s, k)][:, sup.query_positions][:, -n_sp:]
                 pred_tok = self.stages[s].commit_index(
                     q_logits, sample=self.commit_mode == "sample"
                 )

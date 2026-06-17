@@ -184,7 +184,9 @@ class PyramidSchedule:
             return set()
         return set(self._rf_to_frames[stage_idx][token_idx])
 
-    def build_shift_supervision(self, stage_idx: int, shift_idx: int) -> ShiftSupervision:
+    def build_shift_supervision(
+        self, stage_idx: int, shift_idx: int, dense: bool = False
+    ) -> ShiftSupervision:
         ctx_end = self._context_end[stage_idx]
         tgt_t = self.target_token_index(stage_idx, shift_idx)
         if tgt_t >= self.native_t(stage_idx):
@@ -193,10 +195,23 @@ class PyramidSchedule:
                 f"(T={self.native_t(stage_idx)})"
             )
         n_sp = self.stages[stage_idx].n_spatial
-        # Query: last context frame predicts the next native token (shift +1)
-        query_t = min(ctx_end, tgt_t - 1)
-        query_positions = torch.arange(query_t * n_sp, (query_t + 1) * n_sp, dtype=torch.long)
-        target_positions = torch.arange(tgt_t * n_sp, (tgt_t + 1) * n_sp, dtype=torch.long)
+        if dense:
+            # Dense causal supervision (PLAN_V2 §8.1a): every context position p in
+            # [0..ctx_end] predicts gt frame p + shift_idx + 1 (the same +1-per-shift
+            # horizon offset as the canonical target). ~ctx_end+1x more transitions
+            # per shift at zero extra forward. Causal self-attn => no leakage: position
+            # p never attends to its own target p+k+1. The CANONICAL transition
+            # (p=ctx_end -> tgt_t) is the LAST n_sp entries, so `_lasttok` metrics
+            # slice the tail. All p are in range since p+k+1 <= tgt_t < native_t.
+            query_positions = torch.arange(0, (ctx_end + 1) * n_sp, dtype=torch.long)
+            target_positions = torch.arange(
+                (shift_idx + 1) * n_sp, (ctx_end + shift_idx + 2) * n_sp, dtype=torch.long
+            )
+        else:
+            # Query: last context frame predicts the next native token (shift +1)
+            query_t = min(ctx_end, tgt_t - 1)
+            query_positions = torch.arange(query_t * n_sp, (query_t + 1) * n_sp, dtype=torch.long)
+            target_positions = torch.arange(tgt_t * n_sp, (tgt_t + 1) * n_sp, dtype=torch.long)
         context_positions = torch.arange(0, (ctx_end + 1) * n_sp, dtype=torch.long)
         parent = self.parent_for(stage_idx, shift_idx)
         p_stage, p_shift = (parent if parent else (None, None))

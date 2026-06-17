@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from src.Open_MAGVIT2.modules.predictor.attention.blocks_common import DEFAULT_KIT, BlockKit
 from src.Open_MAGVIT2.modules.predictor.parallel_residual import ParallelPredictorResidual
 from src.Open_MAGVIT2.modules.predictor.rev_back_prop import ReversibleModule
 
@@ -18,18 +19,19 @@ class ReversibleCouplingBlock(ReversibleModule):
         parent_dim: int | None = None,
         mlp_ratio: int = 4,
         custom_backward: bool = True,
+        kit: BlockKit = DEFAULT_KIT,
     ) -> None:
         super().__init__()
         self.custom_backward = custom_backward
 
         self.F = ParallelPredictorResidual(
             dim=dim, n_heads=n_heads, has_cross_attn=has_cross_attn,
-            parent_dim=parent_dim, mlp_ratio=mlp_ratio,
+            parent_dim=parent_dim, mlp_ratio=mlp_ratio, kit=kit,
         )
 
         self.G = ParallelPredictorResidual(
             dim=dim, n_heads=n_heads, has_cross_attn=has_cross_attn,
-            parent_dim=parent_dim, mlp_ratio=mlp_ratio,
+            parent_dim=parent_dim, mlp_ratio=mlp_ratio, kit=kit,
         )
 
         self._self_attn_mask = None
@@ -38,6 +40,15 @@ class ReversibleCouplingBlock(ReversibleModule):
         self._parent_mode = "dual_stream"
         self._parent_o1 = None
         self._parent_o2 = None
+        self._rope_apply = None
+
+    def set_rope(self, rope_apply) -> None:
+        """RoPE (q,k)->(q,k) applier for the full self-attention (None = off).
+
+        Stored as state (like masks/parent) so the custom reversible backward
+        recomputes F/G with the same rotation — it's a pure function of position,
+        so reuse is exact."""
+        self._rope_apply = rope_apply
 
     def set_masks(
         self,
@@ -70,6 +81,7 @@ class ReversibleCouplingBlock(ReversibleModule):
             "self_attn_mask": self._self_attn_mask,
             "cross_kv": self._cross_kv,
             "cross_attn_mask": self._cross_attn_mask,
+            "rope_apply": self._rope_apply,
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

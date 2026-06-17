@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from src.Open_MAGVIT2.modules.predictor.attention.blocks_common import DEFAULT_KIT, BlockKit
 from src.Open_MAGVIT2.modules.predictor.attention.factorized import FactorizedSpaceTimeBlock
 from src.Open_MAGVIT2.modules.predictor.cross_conditioning import (
     CrossConditioning,
@@ -33,10 +34,11 @@ class FactorizedPredictorLayer(nn.Module):
         spatial_window: int | None = None,
         has_cross_attn: bool = False,
         parent_dim: int | None = None,
+        kit: BlockKit = DEFAULT_KIT,
     ) -> None:
         super().__init__()
         self.has_cross_attn = has_cross_attn
-        kw = dict(t_window=t_window, spatial_window=spatial_window)
+        kw = dict(t_window=t_window, spatial_window=spatial_window, kit=kit)
         self.block_f = FactorizedSpaceTimeBlock(dim, n_heads, n_spatial, **kw)
         self.block_g = FactorizedSpaceTimeBlock(dim, n_heads, n_spatial, **kw)
         if has_cross_attn:
@@ -74,10 +76,12 @@ class FactorizedPredictorLayer(nn.Module):
         parent_o1: torch.Tensor | None,
         parent_o2: torch.Tensor | None,
         parent_fused: torch.Tensor | None,
+        rope_temporal=None,
+        rope_spatial=None,
     ) -> torch.Tensor:
         i1, i2 = x.chunk(2, dim=-1)
-        o1 = self.block_f(i1, self_attn_mask)
-        o2 = self.block_g(i2, self_attn_mask)
+        o1 = self.block_f(i1, self_attn_mask, rope_temporal=rope_temporal, rope_spatial=rope_spatial)
+        o2 = self.block_g(i2, self_attn_mask, rope_temporal=rope_temporal, rope_spatial=rope_spatial)
         if self.has_cross_attn and parent_mode != "none":
             if parent_mode == "dual_stream":
                 kv_f = parent_o1 if layer_idx % 2 == 0 else parent_o2

@@ -101,7 +101,72 @@ def smoke_vae_32() -> VideoHierVQModel:
     )
 
 
-def lite_stack(*, n_layers: int = 2, lambda_pred_mse: float = 0.0):
+def smoke_vae_32_bigstep() -> VideoHierVQModel:
+    """Smoke 32px big-step pyramid VAE: top 1x1@T3 / mid 4x4@T5 / bot 16x16@T9.
+
+    x4 spatial steps (blocks_sq u4) + temporal_downsample to keep T at 9/5/3.
+    Exercises the 1x1 GLOBAL top stage end-to-end through encode_tokens /
+    decode_from_indices.
+    """
+    ddconfig = dict(
+        double_z=False, z_channels=16, resolution=32, in_channels=3, out_ch=3,
+        ch=32, ch_mult=[1, 2, 2, 2, 4, 4],
+        temporal_downsample=[False, False, True, False, True],
+        num_res_blocks=1, num_groups=8,
+    )
+    dec_ddconfig = dict(
+        double_z=False, z_channels=16, resolution=32, in_channels=3, out_ch=3,
+        ch=32, ch_mult=[1, 2], num_res_blocks=1, num_groups=8,
+    )
+    hierarchy = dict(
+        mode="sqvae2", token_grid="pyramid", tap_key_format="spatial",
+        sequence_length=9, latent_key="h1_w1",
+        blocks_sq="h1_w1_x1,h4_w4_u4,h16_w16_u4", temporal_up=[2, 2],
+        decoder_source="finest_state", temporal_align_mode="causal",
+        tap_channels=dict(h1_w1=16, h4_w4=64, h16_w16=64),
+    )
+    quantizer = dict(
+        type="sq", prior="zero", size_dict=[512, 256, 128], dim_dict=[16, 32, 32],
+        log_param_q_init=[4.09434] * 3, temperature=dict(init=1.0, decay=1e-5, min=0.3),
+    )
+    return VideoHierVQModel(
+        ddconfig=ddconfig, dec_ddconfig=dec_ddconfig, hierarchy=hierarchy,
+        quantizer=quantizer, learning_rate=1e-4, use_ema=False,
+    )
+
+
+def bigstep_stack(*, n_layers: int = 2, lambda_pred_mse: float = 0.0,
+                  pos_encoding: str = "absolute"):
+    """32px big-step stack — top 1x1 (3 tokens) / mid 4x4 / fine 16x16; grad-safe.
+
+    Same fine grid (9x16x16 = 2304 tokens) as lite_stack, so the train graph stays
+    well under budget. The coarse stage is a single global token per frame (the
+    n_spatial==1 path)."""
+    from src.Open_MAGVIT2.modules.predictor.schedule import StageSpec
+
+    vae = smoke_vae_32_bigstep()
+    specs = (
+        StageSpec("h1_w1", 1, 1, 512, 16),
+        StageSpec("h4_w4", 4, 4, 256, 32),
+        StageSpec("h16_w16", 16, 16, 128, 32),
+    )
+    schedule = PyramidSchedule.from_stage_specs(specs, t_context=5, t_total=9)
+    stages = torch.nn.ModuleList([
+        PredictorStage(
+            dim=32, n_heads=4, n_layers=n_layers, codebook_size=spec.codebook_size,
+            h=spec.H, w=spec.W, max_t=9, max_shifts=4, has_parent=s > 0,
+            pos_encoding=pos_encoding,
+            **V2_STAGE_ATTN[s],
+        )
+        for s, spec in enumerate(schedule.stages)
+    ])
+    prep = BatchPrep(schedule, [-1, 3, 1])
+    orch = EnvelopeOrchestrator(stages, schedule, lambda_pred_mse=lambda_pred_mse)
+    return vae, prep, orch, stages, schedule
+
+
+def lite_stack(*, n_layers: int = 2, lambda_pred_mse: float = 0.0,
+               pos_encoding: str = "absolute"):
     """32px lite-geometry stack — safe for gradient/backward tests.
 
     Fine stage is 9x16x16 = 2304 tokens; the whole 7-shift train graph stays
@@ -120,6 +185,7 @@ def lite_stack(*, n_layers: int = 2, lambda_pred_mse: float = 0.0):
         PredictorStage(
             dim=32, n_heads=4, n_layers=n_layers, codebook_size=spec.codebook_size,
             h=spec.H, w=spec.W, max_t=9, max_shifts=4, has_parent=s > 0,
+            pos_encoding=pos_encoding,
             **V2_STAGE_ATTN[s],
         )
         for s, spec in enumerate(schedule.stages)

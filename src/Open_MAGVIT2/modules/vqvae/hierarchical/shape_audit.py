@@ -77,26 +77,30 @@ def validate_state_chain(
     resolution_keys: List[str],
     layer_upsample: List[bool],
     temporal_up: List[int],
+    layer_factor: List[int] = None,
 ) -> None:
-    """Pyramid (u2) guard: the top-down z_state grid must land exactly on each
+    """Pyramid (uF) guard: the top-down z_state grid must land exactly on each
     tap grid, otherwise tokens leave the native grids and the predictor's
     temporal shift hierarchy silently breaks (Path A correction #1).
 
-    Upsampler semantics: spatial x2 per u2; temporal factor 2 yields
-    T -> 2T - 1 (frame-drop), factor 1 keeps T.
+    Upsampler semantics: spatial xF per uF layer (F = layer_factor, 2 for legacy
+    u2, 4 for u4); temporal factor 2 yields T -> 2T - 1 (frame-drop), factor 1
+    keeps T. ``layer_factor`` defaults to all-2 (legacy) when omitted.
     """
     if not any(layer_upsample):
         return
+    if layer_factor is None:
+        layer_factor = [2] * len(resolution_keys)
     first = normalize_resolution_key(resolution_keys[0])
     t, h, w = audit[first][2], audit[first][3], audit[first][4]
     u2_idx = 0
-    for key, up in zip(resolution_keys, layer_upsample):
+    for key, up, factor in zip(resolution_keys, layer_upsample, layer_factor):
         nk = normalize_resolution_key(key)
         if up:
             t_factor = temporal_up[u2_idx]
             u2_idx += 1
             t = 2 * t - 1 if t_factor == 2 else t
-            h, w = h * 2, w * 2
+            h, w = h * factor, w * factor
         expected = (t, h, w)
         got = tuple(audit[nk][2:])
         if expected != got:

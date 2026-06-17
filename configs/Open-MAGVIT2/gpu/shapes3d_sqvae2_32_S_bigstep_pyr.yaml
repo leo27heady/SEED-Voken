@@ -1,0 +1,187 @@
+# SQ-VAE "big-step" pyramid: 3 stages with x4 spatial steps + a 1x1 GLOBAL top.
+#   top  1x1  @ T3   (a single global vector per coarse frame)
+#   mid  4x4  @ T5
+#   bot  16x16 @ T9
+# Spatial x4 between stages (blocks_sq uF=u4); temporal stays 9/5/3 (temporal_up: [2,2]).
+# Encoder uses temporal_downsample to decouple temporal stride from ch_mult so bot/mid
+# taps keep 64ch while only the 8->4 and 2->1 levels halve time.
+# Motivation: a 3-token global top is far more predictable than a rotating coarse field
+# (see docs/SESSION_SUMMARY_2026-06-16.md) — the topology IS the predictability lever.
+# Gate after training: python scripts/token_quality_report.py --config <this> --ckpt <best>
+seed_everything: 1234
+trainer:
+  accelerator: gpu
+  strategy: auto
+  devices: 1
+  num_nodes: 1
+  precision: 16-mixed
+  max_epochs: 2000
+  check_val_every_n_epoch: 4
+  num_sanity_val_steps: -1
+  log_every_n_steps: 100
+  default_root_dir: ../../checkpoints/vqgan/shapes3d_sqvae2_32_S_bigstep_pyr
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/vqgan/shapes3d_sqvae2_32_S_bigstep_pyr"
+        monitor: val_ema/mse
+        mode: min
+        save_top_k: 3
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_ema/mse
+        mode: min
+        patience: 10
+        min_delta: 0.0
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: src.Open_MAGVIT2.callbacks.video_reconstruction_logger.VideoReconstructionLogger
+      init_args:
+        every_n_epochs: 1
+        max_samples: 7
+        log_wandb: true
+        save_dir: reconstructions
+        cell_size: 96
+    - class_path: src.Open_MAGVIT2.callbacks.nan_guard.NanGuardCallback
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: seed-voken-shapes3d
+      name: sqvae2_32_S_bigstep_pyr
+      save_dir: ../../results/vqgan/
+
+model:
+  class_path: src.Open_MAGVIT2.models.video_hier_vqgan.VideoHierVQModel
+  init_args:
+    progressive_coding: true
+    ddconfig:
+      double_z: False
+      z_channels: 16
+      resolution: 32
+      in_channels: 3
+      out_ch: 3
+      ch: 32
+      # 6 levels -> downsample chain 32->16->8->4->2->1.
+      ch_mult: [1, 2, 2, 2, 4, 4]
+      # temporal stride per downsample level (len = len(ch_mult) - 1 = 5).
+      # Only 8->4 (idx 2) and 2->1 (idx 4) halve time: T 9 -> 9 -> 5 -> 5 -> 3.
+      # => taps land at 16x16@T9, 4x4@T5, 1x1@T3.
+      temporal_downsample: [false, false, true, false, true]
+      num_res_blocks: 1
+      num_groups: 8
+    # finest z_state is 16x16@T9; decoder does a single spatial doubling (16->32), T kept.
+    dec_ddconfig:
+      double_z: False
+      z_channels: 16
+      resolution: 32
+      in_channels: 3
+      out_ch: 3
+      ch: 64
+      ch_mult: [1, 2]
+      num_res_blocks: 2
+      num_groups: 8
+    hierarchy:
+      mode: sqvae2
+      token_grid: pyramid
+      tap_key_format: spatial
+      sequence_length: 9
+      latent_key: h1_w1
+      blocks_sq: "h1_w1_x1,h4_w4_u4,h16_w16_u4"
+      temporal_up: [2, 2]          # T chain 3 -> 5 -> 9 (one causal 2T-1 per stage)
+      decoder_source: finest_state
+      temporal_align_mode: causal
+      tap_channels:
+        h1_w1: 16
+        h4_w4: 64
+        h16_w16: 64
+    quantizer:
+      type: sq
+      prior: zero               # the 1x1 global top is a natural place to try prior: learned
+      # top(1x1) / mid(4x4) / bot(16x16). top is position-poor (3 tokens) -> small K;
+      # mid carries shape -> largest K; bot is fine residual. All tunable.
+      size_dict: [4096, 1024, 256]
+      dim_dict: [256, 128, 64]
+      log_param_q_init: [4.09434, 4.09434, 4.09434]
+      log_param_q_max: 5.0
+      # SQ temporal coherence (already wired) — enable if coarse/mid persistence is weak;
+      # encourages consecutive frames' codes to agree (helps predictability):
+      # temporal_kl_weight: [0.25, 0.1, 0.0]
+      temperature:
+        init: 1.0
+        decay: 1.0e-5
+        min: 0.3
+    loss_cfg:
+      kl_beta: 1.0
+      kl_warmup_steps: 0
+      grad_clip: 1.0
+    learning_rate: 1.0e-4
+    numerical_debug: false
+    training_objective: hq_elbo
+    use_gan: false
+    use_ema: true
+    top_down_width: 16
+    scheduler_type: "None"
+    sche_type: cos
+    wpe: 0.01
+    wp: 2
+    wp0: 0.0
+    max_iter:
+    wp_iter:
+    resume_lr:
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 16
+    num_workers: 8
+    train:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: train
+          sequence_length: 9
+          dataset_size: 50000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    validation:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: validation
+          sequence_length: 9
+          dataset_size: 1000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    test:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: test
+          sequence_length: 9
+          dataset_size: 1000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+
+ckpt_path: null

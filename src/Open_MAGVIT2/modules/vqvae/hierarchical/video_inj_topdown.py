@@ -248,6 +248,9 @@ class SQVAE2TopDown(nn.Module):
         self.num_layers = len(layer_specs)
         self.resolution_keys = [spec[0] for spec in layer_specs]
         self.layer_upsample = [spec[1] for spec in layer_specs]
+        # Per-layer spatial upsample factor (1 for non-upsample x-layers, 2 for
+        # legacy u2, 4 for u4, ...); drives the InjSQBlock Upsampler block_size.
+        self.layer_factor = [spec[2] for spec in layer_specs]
         self.has_u2 = any(self.layer_upsample)
 
         # Per-u2-layer temporal upsampling factor (1 = legacy spatial-only,
@@ -377,7 +380,7 @@ class SQVAE2TopDown(nn.Module):
             self.register_buffer("log_param_q_scalar", log_tensor)
 
         idx_end: List[int] = []
-        for j, (_, up) in enumerate(layer_specs):
+        for j, (_, up, _factor) in enumerate(layer_specs):
             if up:
                 idx_end.append(j - 1)
         idx_end.append(len(layer_specs) - 1)
@@ -388,7 +391,7 @@ class SQVAE2TopDown(nn.Module):
         prior_heads = nn.ModuleDict()
         blocks = []
         u2_seen = 0
-        for i, (res_key, upsample) in enumerate(layer_specs):
+        for i, (res_key, upsample, factor) in enumerate(layer_specs):
             act_ch = tap_channels.get(res_key, z_channels)
             if lc_cfg == "auto":
                 flg_continuous = i in self._idx_end_set
@@ -442,7 +445,7 @@ class SQVAE2TopDown(nn.Module):
                         act_channels=act_ch,
                         width=width,
                         quantizer=q,
-                        up_block_size=(t_up, 2, 2),
+                        up_block_size=(t_up, factor, factor),
                     )
                 )
             else:

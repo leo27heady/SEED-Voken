@@ -178,6 +178,8 @@ class VideoHierVQModel(L.LightningModule):
                     list(self.hier_quant.resolution_keys),
                     list(self.hier_quant.layer_upsample),
                     list(self.hier_quant.temporal_up),
+                    list(getattr(self.hier_quant, "layer_factor",
+                                 [2] * len(self.hier_quant.resolution_keys))),
                 )
         if hasattr(self.hier_quant, "num_layers"):
             num_layers_hint = self.hier_quant.num_layers

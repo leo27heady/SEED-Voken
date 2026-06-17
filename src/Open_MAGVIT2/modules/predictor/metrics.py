@@ -108,6 +108,9 @@ def build_train_log_dict(
     log: Dict[str, torch.Tensor] = {
         "train/loss_ce": out.loss_ce.detach(),
     }
+    if out.loss_ce_lasttok is not None:
+        # gate-comparable canonical-frame CE (== loss_ce when not dense; PLAN_V2 §8.1a)
+        log["train/loss_ce_lasttok"] = out.loss_ce_lasttok.detach()
     if out.loss_mse is not None:
         # already a per-pixel mean over the decoded horizon
         log["train/loss_pred_mse"] = out.loss_mse.detach()
@@ -151,6 +154,9 @@ def build_val_log_dict(
     log: Dict[str, torch.Tensor] = {
         "val/loss_ce_ar": out_ar.loss_ce.detach(),
     }
+    if out_ar.loss_ce_lasttok is not None:
+        # GATE-P3a metric: canonical-frame AR CE, comparable to the pre-dense baseline.
+        log["val/loss_ce_ar_lasttok"] = out_ar.loss_ce_lasttok.detach()
     if out_ar.loss_mse is not None:
         # already a per-pixel mean over the decoded horizon
         log["val/pred_mse_ar"] = out_ar.loss_mse.detach()
@@ -181,6 +187,8 @@ def build_val_log_dict(
         log["val/loss_total_parallel"] = loss_total_par
         log["val/loss_ce_parallel"] = out_par.loss_ce.detach()
         log["val/loss_ce_tf"] = out_par.loss_ce.detach()
+        if out_par.loss_ce_lasttok is not None:
+            log["val/loss_ce_tf_lasttok"] = out_par.loss_ce_lasttok.detach()
         gap = (out_par.loss_ce - out_ar.loss_ce).detach()
         log["val/ce_gap_parallel_minus_ar"] = gap
         log["val/ce_gap_tf_minus_ar"] = gap

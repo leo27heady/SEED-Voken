@@ -32,6 +32,7 @@ class BatchPrep:
         temporal_windows: List[int],
         mask_cache: PredictorMaskCache | None = None,
         cross_spatial_window: int = 0,
+        dense_supervision: bool = False,
     ) -> None:
         self.schedule = schedule
         self.temporal_windows = temporal_windows
@@ -39,6 +40,9 @@ class BatchPrep:
             schedule, cross_spatial_window=cross_spatial_window
         )
         self.mask_cache = mask_cache
+        # Dense causal supervision (PLAN_V2 §8.1a): supervise every t->t+1 transition
+        # in the context, not just the canonical target frame.
+        self.dense_supervision = dense_supervision
 
     def build_full_context_embed(
         self,
@@ -74,12 +78,14 @@ class BatchPrep:
             context_embed[s] = embed
             supervision[s] = {}
             target_indices[s] = {}
+            idx_flat = idx.reshape(idx.shape[0], -1)
             for k in range(self.schedule.shifts_per_stage(s)):
-                sup = self.schedule.build_shift_supervision(s, k)
-                tgt_t = self.schedule.target_token_index(s, k)
-                n_sp = self.schedule.stages[s].n_spatial
-                flat_tgt = idx[:, tgt_t].reshape(idx.shape[0], n_sp)
-                target_indices[s][k] = flat_tgt
+                sup = self.schedule.build_shift_supervision(
+                    s, k, dense=self.dense_supervision
+                )
+                # gather targets by position (covers both single-frame and dense);
+                # for non-dense these are exactly the canonical tgt_t frame's tokens.
+                target_indices[s][k] = idx_flat[:, sup.target_positions]
                 supervision[s][k] = sup
 
         if self.mask_cache is not None:

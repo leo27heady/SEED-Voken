@@ -6,6 +6,12 @@ import torch
 import torch.nn as nn
 from torch.nn import MultiheadAttention as MHA
 
+from src.Open_MAGVIT2.modules.predictor.attention.blocks_common import (
+    DEFAULT_KIT,
+    BlockKit,
+    build_mlp,
+    build_norm,
+)
 from src.Open_MAGVIT2.modules.predictor.attention.utils import mha_self_attention
 
 
@@ -49,21 +55,19 @@ class FactorizedSpaceTimeBlock(nn.Module):
         t_window: int = 1,
         spatial_window: int | None = None,
         mlp_ratio: int = 4,
+        kit: BlockKit = DEFAULT_KIT,
     ) -> None:
         super().__init__()
         self.n_spatial = n_spatial
         self.t_window = t_window
         self.spatial_window = spatial_window
-        self.norm_t = nn.LayerNorm(dim)
-        self.norm_s = nn.LayerNorm(dim)
+        self.kit = kit
+        self.norm_t = build_norm(dim, kit.norm_type)
+        self.norm_s = build_norm(dim, kit.norm_type)
         self.temporal_attn = MHA(dim, n_heads, batch_first=True)
         self.spatial_attn = MHA(dim, n_heads, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim),
-        )
-        self.norm_m = nn.LayerNorm(dim)
+        self.mlp = build_mlp(dim, mlp_ratio, kit.mlp_type)
+        self.norm_m = build_norm(dim, kit.norm_type)
         if spatial_window is not None:
             allowed = build_spatial_window_mask(n_spatial, spatial_window, torch.device("cpu"))
             self.register_buffer(
@@ -72,7 +76,13 @@ class FactorizedSpaceTimeBlock(nn.Module):
                 persistent=False,
             )
 
-    def forward(self, x: torch.Tensor, self_attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        self_attn_mask: torch.Tensor | None = None,
+        rope_temporal=None,
+        rope_spatial=None,
+    ) -> torch.Tensor:
         b, n, d = x.shape
         t_len = n // self.n_spatial
         xt = x.view(b, t_len, self.n_spatial, d).permute(0, 2, 1, 3).reshape(
@@ -83,14 +93,20 @@ class FactorizedSpaceTimeBlock(nn.Module):
         if self_attn_mask is not None:
             n_sp = self.n_spatial
             ta_mask = ~self_attn_mask[: t_len * n_sp, : t_len * n_sp][::n_sp, ::n_sp]
-        t_out = mha_self_attention(self.temporal_attn, yt, attn_mask=ta_mask)
+        t_out = mha_self_attention(
+            self.temporal_attn, yt, attn_mask=ta_mask, rope_apply=rope_temporal,
+            qk_norm=self.kit.qk_norm,
+        )
         xt = xt + t_out
         xs = xt.view(b, self.n_spatial, t_len, d).permute(0, 2, 1, 3).reshape(
             b * t_len, self.n_spatial, d
         )
         ys = self.norm_s(xs)
         sa_mask = self.spatial_attn_mask if self.spatial_window is not None else None
-        s_out, _ = self.spatial_attn(ys, ys, ys, attn_mask=sa_mask)
+        s_out = mha_self_attention(
+            self.spatial_attn, ys, attn_mask=sa_mask, rope_apply=rope_spatial,
+            qk_norm=self.kit.qk_norm,
+        )
         xs = xs + s_out
         x = xs.view(b, t_len, self.n_spatial, d).reshape(b, n, d)
         x = x + self.mlp(self.norm_m(x))

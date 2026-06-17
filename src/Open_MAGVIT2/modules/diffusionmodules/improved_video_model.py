@@ -119,9 +119,32 @@ class ResBlock(nn.Module):
 
         return x + residual
     
+def _resolve_temporal_strides(
+    ch_mult, temporal_downsample, num_downsamples: int
+) -> List[bool]:
+    """Per-downsample-level temporal-stride flags.
+
+    Legacy behaviour couples temporal stride to ``ch_mult`` (a level with
+    ``ch_mult[i] == 1`` downsamples spatially only; otherwise spatial+temporal).
+    ``temporal_downsample`` (an explicit list of bools, one per downsample level)
+    decouples the two so width and temporal stride can be chosen independently
+    (required by the big-step 16/4/1 pyramid). ``None`` reproduces legacy exactly.
+    """
+    if temporal_downsample is None:
+        return [ch_mult[i] != 1 for i in range(num_downsamples)]
+    flags = [bool(t) for t in temporal_downsample]
+    if len(flags) != num_downsamples:
+        raise ValueError(
+            f"temporal_downsample length {len(flags)} != number of downsample "
+            f"levels {num_downsamples} (len(ch_mult) - 1)"
+        )
+    return flags
+
+
 class Encoder(nn.Module):
-    def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4), 
+    def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4),
                 resolution, double_z=False, num_groups: int = 32,
+                temporal_downsample: Optional[List[bool]] = None,
                 ):
         super().__init__()
 
@@ -132,7 +155,8 @@ class Encoder(nn.Module):
 
         self.num_res_blocks = num_res_blocks
         self.num_blocks = len(ch_mult)
-        
+        t_down = _resolve_temporal_strides(ch_mult, temporal_downsample, self.num_blocks - 1)
+
         self.conv_in = ConvBlock3D(in_channels,
                                    ch,
                                    kernel_size=(3, 3, 3),
@@ -156,10 +180,13 @@ class Encoder(nn.Module):
             down = nn.Module()
             down.block = block
             if i_level < self.num_blocks - 1:
-                if ch_mult[i_level] == 1: #downsampling
-                    down.downsample = ConvBlock3D(block_out, block_out, kernel_size=(3, 3, 3), causal=True, stride=(1, 2, 2), padding=1)
-                else:
-                    down.downsample = ConvBlock3D(block_out, block_out, kernel_size=(3, 3, 3), causal=True, stride=(2, 2, 2), padding=1)
+                # spatial is always halved; temporal halves only when flagged
+                # (decoupled from ch_mult — see _resolve_temporal_strides).
+                t_stride = 2 if t_down[i_level] else 1
+                down.downsample = ConvBlock3D(
+                    block_out, block_out, kernel_size=(3, 3, 3), causal=True,
+                    stride=(t_stride, 2, 2), padding=1,
+                )
 
             self.down.append(down)
         
@@ -206,12 +233,17 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4), 
-                resolution, double_z=False, num_groups: int = 32) -> None:
+    def __init__(self, *, ch, out_ch, in_channels, num_res_blocks, z_channels, ch_mult=(1, 2, 2, 4),
+                resolution, double_z=False, num_groups: int = 32,
+                temporal_upsample: Optional[List[bool]] = None) -> None:
         super().__init__()
 
         self.ch = ch
         self.num_blocks = len(ch_mult)
+        # Mirror of the encoder's per-level temporal stride; index j corresponds
+        # to the upsample that reverses encoder downsample level j. None = legacy
+        # (coupled to ch_mult). Unused for finest_state decoders (single 2x).
+        t_up = _resolve_temporal_strides(ch_mult, temporal_upsample, self.num_blocks - 1)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
@@ -242,10 +274,9 @@ class Decoder(nn.Module):
             up = nn.Module()
             up.block = block
             if i_level > 0:
-                if ch_mult[i_level -1] == 1: #last upsampling
-                    up.upsample = Upsampler(block_in, block_size=(1, 2, 2))
-                else:
-                    up.upsample = Upsampler(block_in, block_size=(2, 2, 2))
+                # spatial always doubled; temporal doubled only when flagged.
+                t_factor = 2 if t_up[i_level - 1] else 1
+                up.upsample = Upsampler(block_in, block_size=(t_factor, 2, 2))
             self.up.insert(0, up)
         
         self.norm_out = FrameWiseGroupNorm(self.num_groups, block_in, eps=1e-6)

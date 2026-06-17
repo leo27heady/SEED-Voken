@@ -1,0 +1,130 @@
+# Predictor on the SQ big-step tokenizer (top 1x1@T3 / mid 4x4@T5 / bot 16x16@T9).
+# Stage geometry is DERIVED from the VAE config (blocks_sq + t_total) — config only.
+# Set vae_ckpt to the gated big-step SQ checkpoint before launching.
+#   - coarse (top) = 3 tokens (3x1x1): full attention, the global-state predictor.
+#   - mid  = 5x4x4 = 80 tokens: factorized.
+#   - fine = 9x16x16 = 2304 tokens: factorized + spatial window.
+# SQ => single learned index per token => output_mode: composite (monolithic K-way head).
+# head_dim = dim/n_heads = 32/16/16 (all >=16, RoPE-ready). pos_encoding: rope once Track A
+# lands its gate; flip back to absolute to reproduce the pre-RoPE baseline.
+seed_everything: 1234
+trainer:
+  accelerator: gpu
+  strategy: auto
+  devices: 1
+  precision: 16-mixed
+  max_epochs: 500
+  gradient_clip_val: 1.0
+  check_val_every_n_epoch: 2
+  log_every_n_steps: 50
+  num_sanity_val_steps: 0
+  default_root_dir: ../../checkpoints/predictor/shapes3d_sqvae2_32_S_bigstep_pyr_predict
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "../../checkpoints/predictor/sqvae2_32_S_bigstep_pyr_predict"
+        monitor: val/loss_ce_ar
+        mode: min
+        save_top_k: 3
+        save_last: true
+        filename: "epoch={epoch:03d}-step={step}-val_ce={val/loss_ce_ar:.4f}"
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: src.Open_MAGVIT2.callbacks.predictor_horizon_logger.PredictorHorizonLogger
+      init_args:
+        every_n_epochs: 1
+        max_samples: 4
+        log_wandb: true
+        save_dir: predictions
+        cell_size: 96
+    - class_path: src.Open_MAGVIT2.callbacks.nan_guard.NanGuardCallback
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: seed-voken-shapes3d
+      name: sqvae2_32_S_bigstep_pyr_predict
+      save_dir: ../../results/predictor/
+
+model:
+  class_path: src.Open_MAGVIT2.models.video_hier_predictor.VideoHierPredictorModel
+  init_args:
+    vae_config: configs/Open-MAGVIT2/gpu/shapes3d_sqvae2_32_S_bigstep_pyr.yaml
+    vae_ckpt: null   # <-- set to the gated big-step SQ best checkpoint
+    freeze_encoder: true
+    t_context: 5
+    t_total: 9
+    parent_conditioning: dual_stream
+    shift_reentry:
+      mode: streams_only
+    predictor:
+      dim: [256, 128, 64]           # top / mid / fine
+      n_layers: [6, 4, 2]
+      n_heads: [8, 8, 4]            # head_dim 32 / 16 / 16
+      temporal_windows: [-1, 3, 2]
+      cross_spatial_window: 1        # 3x3 parent neighborhood (1x1 parent -> all-ones)
+      output_mode: composite         # SQ single index -> K-way head
+      pos_encoding: absolute         # flip to rope after Track A GATE-P1
+      # rope:                        # used when pos_encoding: rope (else default
+      #   axes_per_stage: null       #   axes are auto: time-heavy, 0 spatial for 1x1 top
+      #   base: 10000.0
+      # --- stability kit (PLAN_V2 §6.4), default legacy; flip for a fresh train ---
+      # norm_type: rmsnorm           # layernorm (default) | rmsnorm
+      # mlp_type: swiglu             # mlp (default) | swiglu
+      # qk_norm: true                # parameter-free RMSNorm on q,k before RoPE
+      attention:
+        coarse: {type: full}
+        mid: {type: factorized, t_window: 3}
+        fine: {type: factorized, t_window: 2, spatial_window: 4}
+    loss:
+      lambda_ce: 1.0
+      log_pred_mse: true
+      pred_mse_every_n_steps: 50
+      shift_ce_weights: uniform
+      # dense_supervision: true      # PLAN_V2 §8.1a: score every t->t+1 transition
+      #                              # (~5-8x signal/step). Gate on val/loss_ce_ar_lasttok.
+    inference:
+      mode: autoregressive
+      commit: argmax
+      parallel_mode: context
+    learning_rate: 1.0e-4
+
+data:
+  class_path: main.DataModuleFromConfig
+  init_args:
+    batch_size: 32
+    num_workers: 8
+    train:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: train
+          sequence_length: 9
+          dataset_size: 50000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+    validation:
+      target: src.Open_MAGVIT2.data.shape_video.ShapeVideoDataset
+      params:
+        config:
+          size: 32
+          mode: validation
+          sequence_length: 9
+          dataset_size: 1000
+          cache: true
+          shape_scene_type: DIM_3
+          shape_min_cubes: 2
+          shape_max_cubes: 6
+          shape_angle_min: 15
+          shape_angle_max: 45
+          shape_temporal_patterns: []
+          shape_cache_dir: ../../data/shape_cache
+
+ckpt_path: null

@@ -46,9 +46,18 @@ class PredictorStage(nn.Module):
         use_reversible_backprop: bool = False,
         output_mode: str = "composite",
         levels: list[int] | None = None,
+        pos_encoding: str = "absolute",
+        rope_axes: tuple[int, int, int] | None = None,
+        rope_base: float = 10000.0,
+        norm_type: str = "layernorm",
+        mlp_type: str = "mlp",
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
+        from src.Open_MAGVIT2.modules.predictor.attention.blocks_common import BlockKit
+        kit = BlockKit(norm_type=norm_type, mlp_type=mlp_type, qk_norm=qk_norm)
         self.dim = dim
+        self.n_heads = n_heads
         self.h = h
         self.w = w
         self.n_spatial = h * w
@@ -60,9 +69,22 @@ class PredictorStage(nn.Module):
         self.attention_type = attention_type
         self.use_reversible_backprop = use_reversible_backprop
 
+        # Positional encoding: learned-absolute (legacy default) or factorized 3D
+        # RoPE (relative; length-generalizing for AR; no untrained absolute slots).
+        self.pos_encoding_type = pos_encoding
         self.input_proj = nn.Linear(dim, dim)
-        self.spatial_pos = nn.Parameter(torch.randn(1, self.n_spatial, dim) * 0.02)
-        self.temporal_pos = nn.Parameter(torch.randn(1, max_t, dim) * 0.02)
+        if pos_encoding == "absolute":
+            self.spatial_pos = nn.Parameter(torch.randn(1, self.n_spatial, dim) * 0.02)
+            self.temporal_pos = nn.Parameter(torch.randn(1, max_t, dim) * 0.02)
+            self.rope = None
+        elif pos_encoding == "rope":
+            from src.Open_MAGVIT2.modules.predictor.attention.rope import Rotary3D
+            head_dim = dim // n_heads
+            self.rope = Rotary3D(
+                head_dim, axes=rope_axes, has_spatial=self.n_spatial > 1, base=rope_base
+            )
+        else:
+            raise ValueError(f"unknown pos_encoding {pos_encoding!r}")
         self.shift_embed = nn.Embedding(max_shifts, dim)
 
         if attention_type == "factorized":
@@ -76,6 +98,7 @@ class PredictorStage(nn.Module):
                     spatial_window=spatial_window,
                     has_cross_attn=has_parent,
                     parent_dim=parent_dim or dim,
+                    kit=kit,
                 )
                 for _ in range(n_layers)
             ])
@@ -89,6 +112,7 @@ class PredictorStage(nn.Module):
                     has_cross_attn=has_parent,
                     parent_dim=parent_dim or dim,
                     custom_backward=use_reversible_backprop,
+                    kit=kit,
                 )
                 for _ in range(n_layers)
             ])
@@ -156,11 +180,22 @@ class PredictorStage(nn.Module):
         masks: ShiftMasks,
         t_len: int,
     ) -> ShiftOutput:
+        # RoPE appliers for this shift (None under absolute PE). Built per call so
+        # t_len growth during AR re-entry is handled (length generalization).
+        rope_temporal = rope_spatial = rope_full = None
+        if self.rope is not None:
+            if self.attention_type == "factorized":
+                rope_temporal = self.rope.temporal_applier(t_len)
+                rope_spatial = self.rope.spatial_applier(self.h, self.w)
+            else:
+                rope_full = self.rope.full_applier(t_len, self.h, self.w)
+
         if stream_state is None:
             if context_embed is None:
                 raise ValueError("shift 0 requires context_embed")
             x = self.input_proj(context_embed)
-            x = x + self.pos_encoding(t_len)
+            if self.pos_encoding_type == "absolute":
+                x = x + self.pos_encoding(t_len)
             shift_vec = self.shift_embed(torch.tensor([shift_idx], device=x.device))
             x = x + shift_vec.unsqueeze(1)
             x = torch.cat([x, x], dim=-1)
@@ -174,6 +209,7 @@ class PredictorStage(nn.Module):
         if self.rev_layers is not None:
             for layer_idx, block in enumerate(self.rev_layers):
                 block.set_masks(masks.self_attn, masks.cross_attn)
+                block.set_rope(rope_full)
                 if parent is not None and parent.mode != "none":
                     block.set_parent(
                         parent_mode=parent.mode,
@@ -205,6 +241,8 @@ class PredictorStage(nn.Module):
                     parent_o1=parent.o1 if parent else None,
                     parent_o2=parent.o2 if parent else None,
                     parent_fused=parent.fused if parent else None,
+                    rope_temporal=rope_temporal,
+                    rope_spatial=rope_spatial,
                 )
 
         o1, o2 = torch.chunk(x, 2, dim=-1)

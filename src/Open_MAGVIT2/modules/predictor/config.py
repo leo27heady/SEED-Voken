@@ -73,6 +73,12 @@ class StageConfig:
     temporal_window: int
     output_mode: str = "composite"
     levels: Optional[Tuple[int, ...]] = None
+    pos_encoding: str = "absolute"
+    rope_axes: Optional[Tuple[int, int, int]] = None
+    rope_base: float = 10000.0
+    norm_type: str = "layernorm"
+    mlp_type: str = "mlp"
+    qk_norm: bool = False
 
     def __post_init__(self) -> None:
         AttentionType(self.attention_type)  # raises ValueError on unknown type
@@ -80,6 +86,12 @@ class StageConfig:
             raise ValueError(
                 f"stage dim={self.dim} must be divisible by n_heads={self.n_heads}"
             )
+        if self.pos_encoding not in ("absolute", "rope"):
+            raise ValueError(f"unknown pos_encoding {self.pos_encoding!r}")
+        if self.norm_type not in ("layernorm", "rmsnorm"):
+            raise ValueError(f"unknown norm_type {self.norm_type!r}")
+        if self.mlp_type not in ("mlp", "swiglu"):
+            raise ValueError(f"unknown mlp_type {self.mlp_type!r}")
         if self.output_mode == "factorized_fsq":
             if not self.levels:
                 raise ValueError("output_mode='factorized_fsq' requires FSQ 'levels'")
@@ -159,6 +171,17 @@ class PredictorConfig:
             )
         ]
         attention_cfg = predictor.get("attention", {})
+        pos_encoding = str(predictor.get("pos_encoding", "absolute"))
+        rope_cfg = predictor.get("rope", {}) or {}
+        rope_base = float(rope_cfg.get("base", 10000.0))
+        axes_per_stage = rope_cfg.get("axes_per_stage")
+        if axes_per_stage is not None and len(axes_per_stage) != S:
+            raise ValueError(
+                f"predictor.rope.axes_per_stage length {len(axes_per_stage)} != stages {S}"
+            )
+        norm_type = str(predictor.get("norm_type", "layernorm"))
+        mlp_type = str(predictor.get("mlp_type", "mlp"))
+        qk_norm = bool(predictor.get("qk_norm", False))
         max_shifts = schedule.ratio ** (S - 1)
         # codebook_dim defaults to the VAE dim_dict (so SQ copies its codebook
         # in-place); an explicit predictor.codebook_dim widens the learned token
@@ -179,6 +202,9 @@ class PredictorConfig:
             if output_mode == "factorized_fsq" and levels_per_stage is not None:
                 lv = levels_per_stage[s]
                 stage_levels = tuple(int(x) for x in lv) if lv is not None else None
+            stage_rope_axes = None
+            if axes_per_stage is not None and axes_per_stage[s] is not None:
+                stage_rope_axes = tuple(int(x) for x in axes_per_stage[s])
             stage_cfgs.append(
                 StageConfig(
                     dim=dims[s],
@@ -196,6 +222,12 @@ class PredictorConfig:
                     temporal_window=windows[s],
                     output_mode=output_mode,
                     levels=stage_levels,
+                    pos_encoding=pos_encoding,
+                    rope_axes=stage_rope_axes,
+                    rope_base=rope_base,
+                    norm_type=norm_type,
+                    mlp_type=mlp_type,
+                    qk_norm=qk_norm,
                 )
             )
         return cls(

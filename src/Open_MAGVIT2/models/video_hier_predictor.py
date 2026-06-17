@@ -85,6 +85,9 @@ class VideoHierPredictorModel(L.LightningModule):
         self.lambda_pred_mse = legacy_lambda
         self.lambda_ce = float(loss.get("lambda_ce", 1.0))
         self.pred_mse_activations = loss.get("pred_mse_activations", "zero")
+        # Dense causal supervision (PLAN_V2 §8.1a): score every t->t+1 transition,
+        # not just the canonical target frame. Off = legacy single-frame CE.
+        self.dense_supervision = bool(loss.get("dense_supervision", False))
         self.inference_mode = inference.get("mode", "autoregressive")
         self.commit_mode = inference.get("commit", "argmax")
         self.parallel_mode = inference.get("parallel_mode", "full")
@@ -179,6 +182,12 @@ class VideoHierPredictorModel(L.LightningModule):
                     use_reversible_backprop=cfg.use_reversible_backprop,
                     output_mode=sc.output_mode,
                     levels=list(sc.levels) if sc.levels else None,
+                    pos_encoding=sc.pos_encoding,
+                    rope_axes=sc.rope_axes,
+                    rope_base=sc.rope_base,
+                    norm_type=sc.norm_type,
+                    mlp_type=sc.mlp_type,
+                    qk_norm=sc.qk_norm,
                 )
             )
         self.predictor_stages = pred_stages
@@ -199,6 +208,7 @@ class VideoHierPredictorModel(L.LightningModule):
             temporal_windows,
             mask_cache=self.mask_cache,
             cross_spatial_window=cross_window,
+            dense_supervision=self.dense_supervision,
         )
         self._copy_codebooks()
 
